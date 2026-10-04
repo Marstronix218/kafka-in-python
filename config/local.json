@@ -1,0 +1,10 @@
+{
+  "brokers": {
+    "b1": "http://127.0.0.1:9001",
+    "b2": "http://127.0.0.1:9002",
+    "b3": "http://127.0.0.1:9003"
+  },
+  "topics": {
+    "events": {"partitions": 3, "replication_factor": 3}
+  }
+}

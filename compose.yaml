@@ -1,0 +1,29 @@
+services:
+  controller:
+    build: .
+    command: python -m eventlog controller --config config/docker.json --host 0.0.0.0 --port 8000 --state-dir /data
+    ports: ["9000:8000"]
+    volumes: ["controller-data:/data"]
+  broker1:
+    build: .
+    command: python -m eventlog broker --config config/docker.json --id b1 --controller http://controller:8000 --host 0.0.0.0 --port 8000 --data-dir /data
+    ports: ["9001:8000"]
+    volumes: ["broker1-data:/data"]
+    depends_on: [controller]
+  broker2:
+    build: .
+    command: python -m eventlog broker --config config/docker.json --id b2 --controller http://controller:8000 --host 0.0.0.0 --port 8000 --data-dir /data
+    ports: ["9002:8000"]
+    volumes: ["broker2-data:/data"]
+    depends_on: [controller]
+  broker3:
+    build: .
+    command: python -m eventlog broker --config config/docker.json --id b3 --controller http://controller:8000 --host 0.0.0.0 --port 8000 --data-dir /data
+    ports: ["9003:8000"]
+    volumes: ["broker3-data:/data"]
+    depends_on: [controller]
+volumes:
+  controller-data:
+  broker1-data:
+  broker2-data:
+  broker3-data:

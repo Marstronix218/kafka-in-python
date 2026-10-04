@@ -1,0 +1,10 @@
+{
+  "brokers": {
+    "b1": "http://broker1:8000",
+    "b2": "http://broker2:8000",
+    "b3": "http://broker3:8000"
+  },
+  "topics": {
+    "events": {"partitions": 3, "replication_factor": 3}
+  }
+}
