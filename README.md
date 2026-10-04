@@ -1,6 +1,6 @@
 # Kafka-inspired distributed event log
 
-An educational Python implementation of the [project proposal](IL18105.02_Project_Proposal.md). Three independent HTTP brokers store partitioned, append-only logs. A small controller tracks heartbeats and promotes a surviving replica when a leader stops responding.
+A Python distributed event log with three independent HTTP brokers, partitioned append-only storage, and a controller that promotes a surviving replica when a leader stops responding.
 
 ## Quick start
 

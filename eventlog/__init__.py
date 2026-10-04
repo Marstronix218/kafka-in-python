@@ -1,4 +1,4 @@
-"""Educational, Kafka-inspired distributed event log."""
+"""Kafka-inspired distributed event log."""
 
 from .client import ClusterClient, Consumer
 
