@@ -35,7 +35,7 @@ class PartitionLog:
         self._records: list[dict[str, Any]] = []
 
         self._load_records()
-        self._committed_offset, self._safe_offset = self._load_watermarks()
+        self._committed_offset = self._load_committed_offset()
         if self._committed_offset > self.last_offset:
             raise ValueError("committed offset is beyond the end of the log")
 
@@ -51,17 +51,11 @@ class PartitionLog:
 
         return self._committed_offset
 
-    @property
-    def safe_offset(self) -> int:
-        """Return the quorum-protected high watermark, or -1 when none is safe."""
-
-        return self._safe_offset
-
     def append(self, record: dict[str, Any]) -> None:
         """Durably append ``record``, accepting retries idempotently.
 
-        A conflicting entry beyond the safe high watermark is replaced along with
-        all later entries.  Quorum-protected history cannot be changed.
+        A conflicting entry beyond the committed high watermark is replaced along
+        with all later entries.  Committed history cannot be changed.
         """
 
         canonical = self._canonical_record(record)
@@ -71,8 +65,8 @@ class PartitionLog:
             if offset <= self.last_offset:
                 if self._records[offset] == canonical:
                     return
-                if offset <= self._safe_offset:
-                    raise ValueError("cannot replace a safe record")
+                if offset <= self._committed_offset:
+                    raise ValueError("cannot replace a committed record")
                 self.truncate_from(offset)
 
             if offset != self.last_offset + 1:
@@ -111,47 +105,32 @@ class PartitionLog:
                 return []
             return [self._copy_record(record) for record in self._records[start:stop]]
 
-    def commit(self, offset: int, safe: bool = False) -> None:
-        """Durably advance the visible and optionally safe high watermark."""
+    def commit(self, offset: int) -> None:
+        """Durably advance the committed high watermark."""
 
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < -1:
             raise ValueError("committed offset must be an integer greater than or equal to -1")
-        if not isinstance(safe, bool):
-            raise TypeError("safe must be a boolean")
 
         with self._lock:
-            if not safe and offset < self._committed_offset:
+            if offset < self._committed_offset:
                 raise ValueError("committed offset cannot move backwards")
-            if safe and offset < self._safe_offset:
-                raise ValueError("safe offset cannot move backwards")
             if offset > self.last_offset:
                 raise ValueError("cannot commit beyond the end of the log")
-            new_committed_offset = max(self._committed_offset, offset)
-            new_safe_offset = offset if safe else self._safe_offset
-            if (
-                new_committed_offset == self._committed_offset
-                and new_safe_offset == self._safe_offset
-            ):
+            if offset == self._committed_offset:
                 return
 
-            self._persist_watermarks(new_committed_offset, new_safe_offset)
-            self._committed_offset = new_committed_offset
-            self._safe_offset = new_safe_offset
+            self._persist_committed_offset(offset)
+            self._committed_offset = offset
 
     def truncate_from(self, offset: int) -> None:
-        """Durably remove ``offset`` and all later records outside the safe prefix."""
+        """Durably remove ``offset`` and all later records outside the committed prefix."""
 
         self._validate_offset(offset)
         with self._lock:
-            if offset <= self._safe_offset:
-                raise ValueError("cannot truncate safe records")
+            if offset <= self._committed_offset:
+                raise ValueError("cannot truncate committed records")
             if offset > self.last_offset:
                 return
-
-            new_committed_offset = min(self._committed_offset, offset - 1)
-            if new_committed_offset != self._committed_offset:
-                self._persist_watermarks(new_committed_offset, self._safe_offset)
-                self._committed_offset = new_committed_offset
 
             retained = self._records[:offset]
             contents = b"".join(self._encode(record) for record in retained)
@@ -187,32 +166,24 @@ class PartitionLog:
 
         self._records = records
 
-    def _load_watermarks(self) -> tuple[int, int]:
+    def _load_committed_offset(self) -> int:
         if not self._commit_path.exists():
-            return -1, -1
+            return -1
         try:
             metadata = json.loads(self._commit_path.read_text(encoding="utf-8"))
             committed_offset = metadata["committed_offset"]
-            safe_offset = metadata.get("safe_offset", -1)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
             raise ValueError("invalid committed offset metadata") from None
         if (
             not isinstance(committed_offset, int)
             or isinstance(committed_offset, bool)
             or committed_offset < -1
-            or not isinstance(safe_offset, int)
-            or isinstance(safe_offset, bool)
-            or safe_offset < -1
-            or safe_offset > committed_offset
         ):
             raise ValueError("invalid committed offset metadata")
-        return committed_offset, safe_offset
+        return committed_offset
 
-    def _persist_watermarks(self, committed_offset: int, safe_offset: int) -> None:
-        payload = json.dumps(
-            {"committed_offset": committed_offset, "safe_offset": safe_offset},
-            separators=(",", ":"),
-        )
+    def _persist_committed_offset(self, committed_offset: int) -> None:
+        payload = json.dumps({"committed_offset": committed_offset}, separators=(",", ":"))
         self._atomic_replace(self._commit_path, (payload + "\n").encode("utf-8"))
 
     def _create_empty_file(self) -> None:

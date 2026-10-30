@@ -1,8 +1,8 @@
 """End-to-end tests for the command-line event log cluster.
 
 Each test starts a controller and three broker subprocesses on free local ports.
-The tests deliberately use the public CLI and HTTP fault-injection endpoint rather
-than importing service state, so process boundaries, persistence, and routing are
+The tests deliberately use the public CLI and broker HTTP endpoints rather than
+importing service state, so process boundaries, persistence, and routing are
 covered together.
 """
 
@@ -106,8 +106,6 @@ class SubprocessClusterTests(unittest.TestCase):
             str(self.config_path),
             "--port",
             controller_port,
-            "--state-dir",
-            str(self.work_dir / "controller"),
             "--heartbeat-timeout",
             "0.8",
         )
@@ -173,7 +171,6 @@ class SubprocessClusterTests(unittest.TestCase):
         self,
         value: object,
         *,
-        event_id: str | None = None,
         acks: int = 2,
     ) -> dict:
         arguments = [
@@ -189,8 +186,6 @@ class SubprocessClusterTests(unittest.TestCase):
             "--acks",
             str(acks),
         ]
-        if event_id is not None:
-            arguments.extend(["--event-id", event_id])
         return json.loads(self._cli(*arguments).stdout)
 
     def _consume(self, consumer_id: str, *arguments: str) -> list[dict]:
@@ -214,13 +209,6 @@ class SubprocessClusterTests(unittest.TestCase):
         process = self.processes[broker_id]
         process.terminate()
         process.wait(timeout=3)
-
-    def _restart_broker(self, broker_id: str) -> None:
-        self._start_broker(broker_id)
-        self._wait_for(
-            lambda: request_json(self.broker_urls[broker_id] + "/health"),
-            process_name=broker_id,
-        )
 
     def _status(self, broker_id: str) -> dict:
         return request_json(
@@ -307,103 +295,43 @@ class SubprocessClusterTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("insufficient replicas", result.stderr)
 
-    def test_lost_ack_retry_can_create_a_duplicate_event(self) -> None:
-        leader_url = self.broker_urls[self._route()["leader"]]
-        request_json(
-            leader_url + "/fault",
-            "POST",
-            {"drop_ack_once": True},
+    def test_acks_three_write_is_stored_and_committed_on_all_brokers(self) -> None:
+        acknowledgement = self._produce({"sequence": 0}, acks=3)
+
+        self.assertEqual(0, acknowledgement["offset"])
+        for broker_id in self.broker_urls:
+            self.assertEqual(
+                {"last_offset": 0, "committed_offset": 0}, self._status(broker_id)
+            )
+
+    def test_acks_one_succeeds_without_followers_while_acks_two_fails(self) -> None:
+        route = self._route()
+        followers = [broker for broker in route["replicas"] if broker != route["leader"]]
+        for follower in followers:
+            self._stop_broker(follower)
+
+        acknowledgement = self._produce({"sequence": 0}, acks=1)
+        rejected = self._cli(
+            "produce",
+            "--controller",
+            self.controller_url,
+            "--topic",
+            TOPIC,
+            "--partition",
+            "0",
+            "--value",
+            '{"sequence":1}',
+            "--acks",
+            "2",
+            "--retries",
+            "0",
+            check=False,
         )
 
-        acknowledgement = self._produce(
-            {"payment": "captured"}, event_id="payment-123"
-        )
-        records = self._consume("duplicates")
-
-        matching = [
-            record for record in records if record.get("event_id") == "payment-123"
-        ]
-        self.assertEqual(1, acknowledgement["offset"])
-        self.assertEqual([0, 1], [record["offset"] for record in matching])
-
-    def test_divergent_acks_one_history_is_replaced_before_re_election(self) -> None:
-        original_leader = self._route()["leader"]
-        followers = [
-            broker_id
-            for broker_id in self._route()["replicas"]
-            if broker_id != original_leader
-        ]
-        request_json(
-            self.broker_urls[original_leader] + "/fault",
-            "POST",
-            {"blocked_peers": followers},
-        )
-        isolated_ack = self._produce(
-            {"history": "A"}, event_id="isolated-A", acks=1
-        )
-        self.assertEqual(0, isolated_ack["offset"])
-        self.assertTrue(all(self._status(peer)["last_offset"] == -1 for peer in followers))
-
-        self._stop_broker(original_leader)
-        replacement_route = self._wait_for(
-            lambda: self._route_after_failover(original_leader),
-            timeout=5,
-        )
-        replacement_leader = replacement_route["leader"]
-        safe_ack = self._produce({"history": "B"}, event_id="safe-B", acks=2)
-        self.assertEqual(0, safe_ack["offset"])
-
-        self._restart_broker(original_leader)
-        self._wait_for(
-            lambda: self._status(original_leader)["safe_offset"] >= 0,
-            timeout=5,
-        )
-        self._stop_broker(replacement_leader)
-        final_route = self._wait_for(
-            lambda: self._route_after_failover(replacement_leader),
-            timeout=5,
-        )
-        records = self._consume("reconciled-history")
-
-        self.assertIn(final_route["leader"], [original_leader, *followers])
-        self.assertEqual(["B"], [record["value"]["history"] for record in records])
-
-    def test_retry_after_dropped_tcp_response_can_create_a_duplicate_event(self) -> None:
-        leader = self._route()["leader"]
-        host, port_text = self.broker_urls[leader].removeprefix("http://").split(":")
-        body = json.dumps(
-            {
-                "topic": TOPIC,
-                "partition": 0,
-                "key": None,
-                "value": {"transport": "response-dropped"},
-                "acks": 2,
-                "event_id": "tcp-drop-123",
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        request = (
-            f"POST /produce HTTP/1.1\r\nHost: {host}:{port_text}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("ascii") + body
-        connection = socket.create_connection((host, int(port_text)), timeout=2)
-        connection.sendall(request)
-        connection.shutdown(socket.SHUT_RDWR)
-        connection.close()
-        self._wait_for(lambda: self._status(leader)["safe_offset"] >= 0)
-
-        retry_ack = self._produce(
-            {"transport": "response-dropped"},
-            event_id="tcp-drop-123",
-        )
-        records = self._consume("tcp-duplicates")
-
-        duplicates = [
-            record for record in records if record.get("event_id") == "tcp-drop-123"
-        ]
-        self.assertEqual(1, retry_ack["offset"])
-        self.assertEqual([0, 1], [record["offset"] for record in duplicates])
+        self.assertEqual(0, acknowledgement["offset"])
+        self.assertEqual(0, self._status(route["leader"])["committed_offset"])
+        self.assertNotEqual(0, rejected.returncode)
+        self.assertIn("insufficient replicas", rejected.stderr)
 
 
 if __name__ == "__main__":

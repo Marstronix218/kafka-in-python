@@ -22,7 +22,7 @@ class ClusterClient:
         return request_json(self.controller_url + "/route?" + urlencode({"topic": topic, "partition": partition}))
 
     def produce(self, topic: str, value: object, key: str | None = None, partition: int | None = None,
-                acks: int = 2, event_id: str | None = None, retries: int = 3) -> dict:
+                acks: int = 2, retries: int = 3) -> dict:
         if partition is None:
             metadata = self.metadata()
             try:
@@ -30,7 +30,7 @@ class ClusterClient:
             except KeyError as exc:
                 raise ValueError("unknown topic") from exc
             partition = partition_for_key(key, count, value)
-        body = {"topic": topic, "partition": partition, "key": key, "value": value, "acks": acks, "event_id": event_id}
+        body = {"topic": topic, "partition": partition, "key": key, "value": value, "acks": acks}
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
