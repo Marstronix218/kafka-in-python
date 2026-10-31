@@ -111,7 +111,7 @@ class SubprocessClusterTests(unittest.TestCase):
         )
         self._wait_for(lambda: request_json(self.controller_url + "/health"))
 
-        for broker_id, broker_url in self.broker_urls.items():
+        for broker_id in self.broker_urls:
             self._start_broker(broker_id)
         for broker_id, broker_url in self.broker_urls.items():
             self._wait_for(
@@ -167,26 +167,27 @@ class SubprocessClusterTests(unittest.TestCase):
             check=check,
         )
 
-    def _produce(
-        self,
-        value: object,
-        *,
-        acks: int = 2,
-    ) -> dict:
+    def _produce_command(self, value: object, acks: int, retries: int | None = None) -> list[str]:
         arguments = [
             "produce",
-            "--controller",
-            self.controller_url,
-            "--topic",
-            TOPIC,
-            "--partition",
-            "0",
-            "--value",
-            json.dumps(value),
-            "--acks",
-            str(acks),
+            "--controller", self.controller_url,
+            "--topic", TOPIC,
+            "--partition", "0",
+            "--value", json.dumps(value),
+            "--acks", str(acks),
         ]
-        return json.loads(self._cli(*arguments).stdout)
+        if retries is not None:
+            arguments += ["--retries", str(retries)]
+        return arguments
+
+    def _produce(self, value: object, *, acks: int = 2) -> dict:
+        return json.loads(self._cli(*self._produce_command(value, acks)).stdout)
+
+    def _produce_without_retries(
+        self, value: object, *, acks: int
+    ) -> subprocess.CompletedProcess[str]:
+        """Run produce once and return the finished process, even if it failed."""
+        return self._cli(*self._produce_command(value, acks, retries=0), check=False)
 
     def _consume(self, consumer_id: str, *arguments: str) -> list[dict]:
         result = self._cli(
@@ -220,6 +221,14 @@ class SubprocessClusterTests(unittest.TestCase):
         return request_json(
             self.controller_url + f"/route?topic={TOPIC}&partition=0"
         )
+
+    def _stop_followers(self) -> dict:
+        """Stop every replica except the leader, and return the route from before."""
+        route = self._route()
+        for broker_id in route["replicas"]:
+            if broker_id != route["leader"]:
+                self._stop_broker(broker_id)
+        return route
 
     def _route_after_failover(self, original_leader: str) -> dict | None:
         route = self._route()
@@ -270,27 +279,9 @@ class SubprocessClusterTests(unittest.TestCase):
         self.assertEqual(list(range(4)), [record["value"]["sequence"] for record in records])
 
     def test_produce_is_rejected_when_acknowledgement_quorum_is_unavailable(self) -> None:
-        route = self._route()
-        followers = [broker for broker in route["replicas"] if broker != route["leader"]]
-        for follower in followers:
-            self._stop_broker(follower)
+        self._stop_followers()
 
-        result = self._cli(
-            "produce",
-            "--controller",
-            self.controller_url,
-            "--topic",
-            TOPIC,
-            "--partition",
-            "0",
-            "--value",
-            '{"cannot":"commit"}',
-            "--acks",
-            "2",
-            "--retries",
-            "0",
-            check=False,
-        )
+        result = self._produce_without_retries({"cannot": "commit"}, acks=2)
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("insufficient replicas", result.stderr)
@@ -305,28 +296,10 @@ class SubprocessClusterTests(unittest.TestCase):
             )
 
     def test_acks_one_succeeds_without_followers_while_acks_two_fails(self) -> None:
-        route = self._route()
-        followers = [broker for broker in route["replicas"] if broker != route["leader"]]
-        for follower in followers:
-            self._stop_broker(follower)
+        route = self._stop_followers()
 
         acknowledgement = self._produce({"sequence": 0}, acks=1)
-        rejected = self._cli(
-            "produce",
-            "--controller",
-            self.controller_url,
-            "--topic",
-            TOPIC,
-            "--partition",
-            "0",
-            "--value",
-            '{"sequence":1}',
-            "--acks",
-            "2",
-            "--retries",
-            "0",
-            check=False,
-        )
+        rejected = self._produce_without_retries({"sequence": 1}, acks=2)
 
         self.assertEqual(0, acknowledgement["offset"])
         self.assertEqual(0, self._status(route["leader"])["committed_offset"])

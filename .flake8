@@ -1,0 +1,4 @@
+[flake8]
+# The project uses 100 columns instead of PEP 8's 79. Signatures and log
+# messages here run long, and wrapping all of them at 79 hurt more than it helped.
+max-line-length = 100

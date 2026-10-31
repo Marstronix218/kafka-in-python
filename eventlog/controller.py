@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .common import replica_ids
+
 
 class ControllerState:
     """Thread-safe controller state for a statically assigned broker cluster."""
@@ -30,7 +32,7 @@ class ControllerState:
         self._leaders: dict[str, str] = {}
 
     @staticmethod
-    def _key(topic: str, partition: int) -> str:
+    def _partition_key(topic: str, partition: int) -> str:
         return f"{topic}:{partition}"
 
     def replicas_for(self, topic: str, partition: int) -> list[str]:
@@ -42,10 +44,7 @@ class ControllerState:
         if partition < 0 or partition >= partitions:
             raise KeyError(f"unknown partition: {topic}:{partition}")
 
-        broker_ids = list(self.brokers)
-        replication_factor = min(int(topic_config["replication_factor"]), len(broker_ids))
-        start = partition % len(broker_ids)
-        return [broker_ids[(start + offset) % len(broker_ids)] for offset in range(replication_factor)]
+        return replica_ids(list(self.brokers), partition, int(topic_config["replication_factor"]))
 
     def heartbeat(self, broker_id: str) -> None:
         if broker_id not in self.brokers:
@@ -60,7 +59,7 @@ class ControllerState:
 
     def route(self, topic: str, partition: int) -> dict[str, Any] | None:
         replicas = self.replicas_for(topic, partition)
-        key = self._key(topic, partition)
+        key = self._partition_key(topic, partition)
 
         with self._lock:
             now = time.monotonic()

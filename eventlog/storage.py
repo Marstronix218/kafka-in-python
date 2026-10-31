@@ -9,6 +9,15 @@ from pathlib import Path
 from typing import Any
 
 
+def _is_int(value: object) -> bool:
+    # bool is a subclass of int, and True must not pass as offset 1.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _to_json(record: dict[str, Any]) -> str:
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+
+
 class PartitionLog:
     """A durable, append-only JSONL log for one topic partition.
 
@@ -24,7 +33,7 @@ class PartitionLog:
             raise ValueError("topic must be a non-empty name")
         if Path(topic).name != topic:
             raise ValueError("topic must not contain path separators")
-        if not isinstance(partition, int) or isinstance(partition, bool) or partition < 0:
+        if not _is_int(partition) or partition < 0:
             raise ValueError("partition must be a non-negative integer")
 
         self._directory = Path(data_dir) / topic
@@ -94,7 +103,7 @@ class PartitionLog:
         """Read at most ``limit`` committed records beginning at ``start``."""
 
         self._validate_offset(start)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        if not _is_int(limit) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
         if limit == 0:
             return []
@@ -108,7 +117,7 @@ class PartitionLog:
     def commit(self, offset: int) -> None:
         """Durably advance the committed high watermark."""
 
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < -1:
+        if not _is_int(offset) or offset < -1:
             raise ValueError("committed offset must be an integer greater than or equal to -1")
 
         with self._lock:
@@ -147,6 +156,9 @@ class PartitionLog:
         records: list[dict[str, Any]] = []
         lines = data.splitlines(keepends=True)
 
+        # A crash in the middle of append() can leave the final line without its
+        # newline. That record was never acknowledged, so it is cut off. Damage
+        # anywhere else means the file is corrupt, and we refuse to start.
         for index, line in enumerate(lines):
             is_last = index == len(lines) - 1
             try:
@@ -174,11 +186,7 @@ class PartitionLog:
             committed_offset = metadata["committed_offset"]
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
             raise ValueError("invalid committed offset metadata") from None
-        if (
-            not isinstance(committed_offset, int)
-            or isinstance(committed_offset, bool)
-            or committed_offset < -1
-        ):
+        if not _is_int(committed_offset) or committed_offset < -1:
             raise ValueError("invalid committed offset metadata")
         return committed_offset
 
@@ -233,24 +241,25 @@ class PartitionLog:
         if missing:
             raise ValueError(f"record is missing required fields: {', '.join(sorted(missing))}")
         offset = record["offset"]
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        if not _is_int(offset) or offset < 0:
             raise ValueError("record offset must be a non-negative integer")
+        # Round-trip through JSON so the stored form is exactly what a reader gets
+        # back from disk (tuples become lists, and so on).
         try:
-            return json.loads(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            return json.loads(_to_json(record))
         except (TypeError, ValueError):
             raise ValueError("record must contain only JSON-serializable values") from None
 
     @staticmethod
     def _validate_offset(offset: int) -> None:
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        if not _is_int(offset) or offset < 0:
             raise ValueError("offset must be a non-negative integer")
 
     @staticmethod
     def _encode(record: dict[str, Any]) -> bytes:
-        return (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
-            "utf-8"
-        )
+        return (_to_json(record) + "\n").encode("utf-8")
 
-    @classmethod
-    def _copy_record(cls, record: dict[str, Any]) -> dict[str, Any]:
-        return json.loads(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+    @staticmethod
+    def _copy_record(record: dict[str, Any]) -> dict[str, Any]:
+        # A deep copy, so callers can't modify the log's records in place.
+        return json.loads(_to_json(record))

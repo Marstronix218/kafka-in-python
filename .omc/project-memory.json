@@ -1,0 +1,126 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1793392781424,
+  "projectRoot": "/Users/nori/Desktop/kafka-in-python",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "config": {
+      "path": "config",
+      "purpose": "Configuration files",
+      "fileCount": 2,
+      "lastAccessed": 1793392781412,
+      "keyFiles": [
+        "docker.json",
+        "local.json"
+      ]
+    },
+    "eventlog": {
+      "path": "eventlog",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1793392781416,
+      "keyFiles": [
+        "__init__.py",
+        "__main__.py",
+        "broker.py",
+        "client.py",
+        "common.py"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 3,
+      "lastAccessed": 1793392781417,
+      "keyFiles": [
+        "test_controller.py",
+        "test_integration.py",
+        "test_storage.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "eventlog/client.py",
+      "accessCount": 4,
+      "lastAccessed": 1793433646880,
+      "type": "file"
+    },
+    {
+      "path": "eventlog/common.py",
+      "accessCount": 2,
+      "lastAccessed": 1793433648046,
+      "type": "file"
+    },
+    {
+      "path": "eventlog/broker.py",
+      "accessCount": 2,
+      "lastAccessed": 1793433722791,
+      "type": "file"
+    },
+    {
+      "path": "eventlog/__main__.py",
+      "accessCount": 2,
+      "lastAccessed": 1793433741122,
+      "type": "file"
+    },
+    {
+      "path": "eventlog/storage.py",
+      "accessCount": 1,
+      "lastAccessed": 1793395090035,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_storage.py",
+      "accessCount": 1,
+      "lastAccessed": 1793395090569,
+      "type": "file"
+    },
+    {
+      "path": "eventlog/controller.py",
+      "accessCount": 1,
+      "lastAccessed": 1793395098255,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_controller.py",
+      "accessCount": 1,
+      "lastAccessed": 1793395098835,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1793395204312,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

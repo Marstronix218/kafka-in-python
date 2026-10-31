@@ -1,16 +1,26 @@
-"""Independent broker process with leader/follower replication and acknowledgments."""
+"""A broker process. It stores the partitions assigned to it, leads some of them,
+and copies each new record to the followers before acknowledging the write."""
 
 from __future__ import annotations
 
 import json
 import threading
 import time
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
-from .common import APIError, MAX_RECORD_BYTES, request_json, validate_config
+from .common import (DEFAULT_ACKS, MAX_RECORD_BYTES, NOT_LEADER, UNAVAILABLE, APIError,
+                     replica_ids, request_json, validate_config)
 from .storage import PartitionLog
+
+
+HEARTBEAT_INTERVAL_SECONDS = 0.5
+PEER_TIMEOUT_SECONDS = 1.0
+MAX_FETCH_LIMIT = 1000
+# A request body is one record plus the topic, partition and other fields around it.
+MAX_REQUEST_BYTES = MAX_RECORD_BYTES + 4096
 
 
 class BrokerState:
@@ -22,132 +32,174 @@ class BrokerState:
         self.controller_url = controller_url.rstrip("/")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.stop_event = threading.Event()
+
+        # Only partitions this broker is a replica of get a log and a lock.
         self.logs: dict[tuple[str, int], PartitionLog] = {}
         self.locks: dict[tuple[str, int], threading.RLock] = {}
-        self.stop_event = threading.Event()
         for topic, spec in config["topics"].items():
             for partition in range(spec["partitions"]):
-                replicas = self._replicas(topic, partition)
-                if broker_id in replicas:
-                    key = (topic, partition)
-                    self.logs[key] = PartitionLog(self.data_dir, topic, partition)
-                    self.locks[key] = threading.RLock()
+                if broker_id in self._replicas(topic, partition):
+                    self.logs[(topic, partition)] = PartitionLog(self.data_dir, topic, partition)
+                    self.locks[(topic, partition)] = threading.RLock()
 
     def _replicas(self, topic: str, partition: int) -> list[str]:
-        ids = list(self.config["brokers"])
-        rf = self.config["topics"][topic]["replication_factor"]
-        return [ids[(partition + i) % len(ids)] for i in range(rf)]
+        replication_factor = self.config["topics"][topic]["replication_factor"]
+        return replica_ids(list(self.config["brokers"]), partition, replication_factor)
+
+    def _lock_for(self, topic: str, partition: int) -> threading.RLock:
+        # A partition this broker doesn't hold has no lock. Handing back a throwaway
+        # one lets the caller reach self.log(), which raises the proper 404.
+        return self.locks.get((topic, partition), threading.RLock())
 
     def log(self, topic: str, partition: int) -> PartitionLog:
         if (topic, partition) not in self.logs:
-            raise APIError(404, "topic partition is not assigned to this broker")
+            raise APIError(HTTPStatus.NOT_FOUND, "topic partition is not assigned to this broker")
         return self.logs[(topic, partition)]
 
     def route(self, topic: str, partition: int) -> dict:
-        from urllib.parse import urlencode
-        return request_json(self.controller_url + "/route?" + urlencode({"topic": topic, "partition": partition}))
+        query = urlencode({"topic": topic, "partition": partition})
+        return request_json(self.controller_url + "/route?" + query)
 
     def _require_leader(self, topic: str, partition: int) -> dict:
         route = self.route(topic, partition)
         if route["leader"] != self.broker_id:
-            raise APIError(409, "not leader; current leader is " + route["leader"])
+            raise APIError(NOT_LEADER, "not leader; current leader is " + route["leader"])
         return route
+
+    def _require_sent_by_leader(self, body: dict, topic: str, partition: int) -> None:
+        # A broker that has just lost leadership may still be sending. Only the broker
+        # the controller names right now is allowed to write to followers.
+        if body.get("leader") != self.route(topic, partition)["leader"]:
+            raise APIError(NOT_LEADER, "request is not from the current leader")
 
     def heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                request_json(self.controller_url + "/heartbeat", "POST", {"broker_id": self.broker_id})
+                request_json(self.controller_url + "/heartbeat", "POST",
+                             {"broker_id": self.broker_id})
             except (APIError, OSError):
+                # Nothing to do here. Missed heartbeats are how the controller finds out.
                 pass
-            self.stop_event.wait(0.5)
+            self.stop_event.wait(HEARTBEAT_INTERVAL_SECONDS)
 
     def produce(self, body: dict) -> dict:
-        topic = body.get("topic")
-        partition = body.get("partition")
-        if topic not in self.config["topics"] or type(partition) is not int:
-            raise APIError(400, "valid topic and integer partition are required")
-        if not 0 <= partition < self.config["topics"][topic]["partitions"]:
-            raise APIError(400, "invalid partition")
-        key = body.get("key")
-        if key is not None and not isinstance(key, str):
-            raise APIError(400, "key must be a string or null")
-        if "value" not in body:
-            raise APIError(400, "value is required")
-        acks = body.get("acks", 2)
-        if type(acks) is not int or not 1 <= acks <= self.config["topics"][topic]["replication_factor"]:
-            raise APIError(400, "acks must be between 1 and replication factor")
+        topic, partition, key, acks = self._validate_produce(body)
         with self.locks[(topic, partition)]:
             route = self._require_leader(topic, partition)
             log = self.log(topic, partition)
             # Drop an uncommitted record left behind by an earlier failed write.
             log.truncate_from(log.committed_offset + 1)
-            record = {"offset": log.last_offset + 1, "key": key, "value": body["value"], "timestamp": time.time()}
+            record = {"offset": log.last_offset + 1, "key": key, "value": body["value"],
+                      "timestamp": time.time()}
             if len(json.dumps(record, ensure_ascii=False).encode()) > MAX_RECORD_BYTES:
-                raise APIError(413, "record exceeds 1 MiB")
+                raise APIError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "record exceeds 1 MiB")
             log.append(record)
-            persisted = []
-            for peer in route["replicas"]:
-                if peer == self.broker_id:
-                    continue
-                try:
-                    request_json(self.config["brokers"][peer] + "/replicate", "POST", {"topic": topic, "partition": partition, "leader": self.broker_id, "record": record}, timeout=1.0)
-                    persisted.append(peer)
-                except APIError:
-                    pass
-            if 1 + len(persisted) < acks:
-                raise APIError(503, "insufficient replicas for requested acknowledgments")
+
+            followers = [peer for peer in route["replicas"] if peer != self.broker_id]
+            stored_on = []
+            for peer in followers:
+                if self._send_to_peer(peer, "/replicate", topic, partition, record=record):
+                    stored_on.append(peer)
+            # The leader's own copy counts toward acks, hence the 1.
+            if 1 + len(stored_on) < acks:
+                raise APIError(UNAVAILABLE, "insufficient replicas for requested acknowledgments")
+
             log.commit(record["offset"])
-            for peer in persisted:
-                try:
-                    request_json(self.config["brokers"][peer] + "/commit", "POST", {"topic": topic, "partition": partition, "leader": self.broker_id, "offset": record["offset"]}, timeout=1.0)
-                except APIError:
-                    pass
-            return {"topic": topic, "partition": partition, "offset": record["offset"], "acks": acks}
+            # Best effort. A follower that misses this still holds the record, it just
+            # doesn't know the record is committed (see "Current limitations" in the README).
+            for peer in stored_on:
+                self._send_to_peer(peer, "/commit", topic, partition, offset=record["offset"])
+            return {"topic": topic, "partition": partition, "offset": record["offset"],
+                    "acks": acks}
+
+    def _validate_produce(self, body: dict) -> tuple[str, int, str | None, int]:
+        topic = body.get("topic")
+        partition = body.get("partition")
+        if topic not in self.config["topics"] or type(partition) is not int:
+            raise APIError(HTTPStatus.BAD_REQUEST, "valid topic and integer partition are required")
+        topic_config = self.config["topics"][topic]
+        if not 0 <= partition < topic_config["partitions"]:
+            raise APIError(HTTPStatus.BAD_REQUEST, "invalid partition")
+        key = body.get("key")
+        if key is not None and not isinstance(key, str):
+            raise APIError(HTTPStatus.BAD_REQUEST, "key must be a string or null")
+        if "value" not in body:
+            raise APIError(HTTPStatus.BAD_REQUEST, "value is required")
+        acks = body.get("acks", DEFAULT_ACKS)
+        if type(acks) is not int or not 1 <= acks <= topic_config["replication_factor"]:
+            raise APIError(HTTPStatus.BAD_REQUEST, "acks must be between 1 and replication factor")
+        return topic, partition, key, acks
+
+    def _send_to_peer(self, peer: str, path: str, topic: str, partition: int, **fields) -> bool:
+        """POST to another broker. Returns False instead of raising if it fails."""
+        body = {"topic": topic, "partition": partition, "leader": self.broker_id, **fields}
+        try:
+            request_json(self.config["brokers"][peer] + path, "POST", body,
+                         timeout=PEER_TIMEOUT_SECONDS)
+            return True
+        except APIError:
+            return False
 
     def replicate(self, body: dict) -> dict:
-        topic, partition = body.get("topic"), body.get("partition")
-        if type(partition) is not int:
-            raise APIError(400, "invalid partition")
-        with self.locks.get((topic, partition), threading.RLock()):
+        topic, partition = _topic_and_partition(body)
+        with self._lock_for(topic, partition):
             log = self.log(topic, partition)
-            if body.get("leader") != self.route(topic, partition)["leader"]:
-                raise APIError(409, "request is not from the current leader")
+            self._require_sent_by_leader(body, topic, partition)
             record = body.get("record")
             if not isinstance(record, dict) or type(record.get("offset")) is not int:
-                raise APIError(400, "invalid record")
+                raise APIError(HTTPStatus.BAD_REQUEST, "invalid record")
             try:
                 log.append(record)
             except (ValueError, TypeError, KeyError) as exc:
-                raise APIError(409, str(exc)) from exc
+                # The record doesn't fit this replica's log: a gap in offsets, or it
+                # would overwrite a committed record.
+                raise APIError(HTTPStatus.CONFLICT, str(exc)) from exc
             return {"offset": record["offset"]}
 
     def commit_replica(self, body: dict) -> dict:
-        topic, partition = body.get("topic"), body.get("partition")
-        if type(partition) is not int:
-            raise APIError(400, "invalid partition")
-        with self.locks.get((topic, partition), threading.RLock()):
+        topic, partition = _topic_and_partition(body)
+        with self._lock_for(topic, partition):
             log = self.log(topic, partition)
-            if body.get("leader") != self.route(topic, partition)["leader"]:
-                raise APIError(409, "request is not from the current leader")
+            self._require_sent_by_leader(body, topic, partition)
             try:
                 log.commit(body["offset"])
             except (KeyError, ValueError, TypeError) as exc:
-                raise APIError(409, str(exc)) from exc
+                raise APIError(HTTPStatus.CONFLICT, str(exc)) from exc
             return {"committed_offset": log.committed_offset}
 
     def fetch(self, topic: str, partition: int, offset: int, limit: int) -> dict:
-        with self.locks.get((topic, partition), threading.RLock()):
+        with self._lock_for(topic, partition):
             self._require_leader(topic, partition)
-            if offset < 0 or not 1 <= limit <= 1000:
-                raise APIError(400, "offset must be nonnegative and limit 1..1000")
+            if offset < 0 or not 1 <= limit <= MAX_FETCH_LIMIT:
+                raise APIError(HTTPStatus.BAD_REQUEST,
+                               f"offset must be nonnegative and limit 1..{MAX_FETCH_LIMIT}")
             log = self.log(topic, partition)
             return {"records": log.read(offset, limit), "committed_offset": log.committed_offset}
 
+    def status(self, topic: str, partition: int) -> dict:
+        # This broker's own copy, leader or not. Used to check replication by hand and in tests.
+        log = self.log(topic, partition)
+        return {"last_offset": log.last_offset, "committed_offset": log.committed_offset}
+
+
+def _topic_and_partition(body: dict) -> tuple[object, int]:
+    topic, partition = body.get("topic"), body.get("partition")
+    if type(partition) is not int:
+        raise APIError(HTTPStatus.BAD_REQUEST, "invalid partition")
+    return topic, partition
+
 
 def make_handler(state: BrokerState):
+    post_routes = {
+        "/produce": state.produce,
+        "/replicate": state.replicate,
+        "/commit": state.commit_replica,
+    }
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
-            pass
+            pass  # don't print a line for every request
 
         def respond(self, code: int, data: dict) -> None:
             payload = json.dumps(data, separators=(",", ":")).encode()
@@ -157,57 +209,60 @@ def make_handler(state: BrokerState):
             self.end_headers()
             self.wfile.write(payload)
 
+        def respond_error(self, exc: Exception) -> None:
+            # Anything that isn't an APIError is malformed input that got past
+            # validation, like a non-numeric offset, so it's the client's fault.
+            status = exc.status if isinstance(exc, APIError) else HTTPStatus.BAD_REQUEST
+            self.respond(status, {"error": str(exc)})
+
         def body(self) -> dict:
             size = int(self.headers.get("Content-Length", "0"))
-            if size > MAX_RECORD_BYTES + 4096 or size < 0:
-                raise APIError(413, "request too large")
+            if size > MAX_REQUEST_BYTES or size < 0:
+                raise APIError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request too large")
             data = json.loads(self.rfile.read(size))
             if not isinstance(data, dict):
-                raise APIError(400, "JSON object required")
+                raise APIError(HTTPStatus.BAD_REQUEST, "JSON object required")
             return data
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            q = parse_qs(parsed.query)
+            query = parse_qs(parsed.query)
+
+            def param(name: str, default: str) -> str:
+                return query.get(name, [default])[0]
+
             try:
                 if parsed.path == "/health":
                     result = {"broker_id": state.broker_id, "ok": True}
-                elif parsed.path in ("/fetch", "/status"):
-                    topic = q.get("topic", [""])[0]
-                    partition = int(q.get("partition", ["-1"])[0])
-                    if parsed.path == "/fetch":
-                        result = state.fetch(topic, partition, int(q.get("offset", ["0"])[0]), int(q.get("limit", ["100"])[0]))
-                    else:
-                        log = state.log(topic, partition)
-                        result = {"last_offset": log.last_offset, "committed_offset": log.committed_offset}
+                elif parsed.path == "/fetch":
+                    result = state.fetch(param("topic", ""), int(param("partition", "-1")),
+                                         int(param("offset", "0")), int(param("limit", "100")))
+                elif parsed.path == "/status":
+                    result = state.status(param("topic", ""), int(param("partition", "-1")))
                 else:
-                    raise APIError(404, "unknown endpoint")
-                self.respond(200, result)
+                    raise APIError(HTTPStatus.NOT_FOUND, "unknown endpoint")
+                self.respond(HTTPStatus.OK, result)
             except (APIError, ValueError) as exc:
-                self.respond(exc.status if isinstance(exc, APIError) else 400, {"error": str(exc)})
+                self.respond_error(exc)
 
         def do_POST(self) -> None:
             try:
                 body = self.body()
-                if self.path == "/produce":
-                    result = state.produce(body)
-                elif self.path == "/replicate":
-                    result = state.replicate(body)
-                elif self.path == "/commit":
-                    result = state.commit_replica(body)
-                else:
-                    raise APIError(404, "unknown endpoint")
-                self.respond(200, result)
+                handler = post_routes.get(self.path)
+                if handler is None:
+                    raise APIError(HTTPStatus.NOT_FOUND, "unknown endpoint")
+                self.respond(HTTPStatus.OK, handler(body))
             except (APIError, ValueError, KeyError, TypeError) as exc:
-                self.respond(exc.status if isinstance(exc, APIError) else 400, {"error": str(exc)})
+                self.respond_error(exc)
 
     return Handler
 
 
-def run_broker(broker_id: str, config: dict, controller_url: str, host: str, port: int, data_dir: str | Path) -> None:
+def run_broker(broker_id: str, config: dict, controller_url: str, host: str, port: int,
+               data_dir: str | Path) -> None:
     state = BrokerState(broker_id, config, controller_url, data_dir)
-    thread = threading.Thread(target=state.heartbeat_loop, daemon=True)
-    thread.start()
+    heartbeats = threading.Thread(target=state.heartbeat_loop, daemon=True)
+    heartbeats.start()
     server = ThreadingHTTPServer((host, port), make_handler(state))
     server.daemon_threads = True
     try:
