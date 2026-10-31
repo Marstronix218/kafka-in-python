@@ -38,17 +38,19 @@ class ControllerState:
     def replicas_for(self, topic: str, partition: int) -> list[str]:
         topic_config = self.topics.get(topic)
         if topic_config is None:
-            raise KeyError(f"unknown topic: {topic}")
+            known = ", ".join(self.topics)
+            raise KeyError(f"unknown topic {topic!r} (known: {known})")
 
         partitions = int(topic_config["partitions"])
         if partition < 0 or partition >= partitions:
-            raise KeyError(f"unknown partition: {topic}:{partition}")
+            raise KeyError(f"partition {partition} does not exist; {topic!r} has "
+                           f"partitions 0..{partitions - 1}")
 
         return replica_ids(list(self.brokers), partition, int(topic_config["replication_factor"]))
 
     def heartbeat(self, broker_id: str) -> None:
         if broker_id not in self.brokers:
-            raise KeyError(f"unknown broker: {broker_id}")
+            raise KeyError(f"unknown broker {broker_id!r} (known: {', '.join(self.brokers)})")
 
         with self._lock:
             self._heartbeats[broker_id] = time.monotonic()
@@ -90,9 +92,16 @@ class ControllerState:
         return {"status": "ok", "alive_brokers": alive}
 
 
+def _error_message(exc: Exception) -> str:
+    # str(KeyError("x")) is "'x'" with quotes, which looks broken in an error message.
+    if isinstance(exc, KeyError) and exc.args:
+        return str(exc.args[0])
+    return str(exc)
+
+
 def _handler_for(state: ControllerState) -> type[BaseHTTPRequestHandler]:
     class ControllerHandler(BaseHTTPRequestHandler):
-        def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        def respond(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
             encoded = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -101,47 +110,53 @@ def _handler_for(state: ControllerState) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(encoded)
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            if urlparse(self.path).path != "/heartbeat":
-                self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            path = urlparse(self.path).path
+            if path != "/heartbeat":
+                self.respond(HTTPStatus.NOT_FOUND, {"error": f"unknown endpoint POST {path}"})
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("request body must be an object")
+                if "broker_id" not in body:
+                    raise ValueError("request body needs a broker_id")
                 broker_id = body["broker_id"]
                 if not isinstance(broker_id, str):
                     raise ValueError("broker_id must be a string")
                 state.heartbeat(broker_id)
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-                self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                self.respond(HTTPStatus.BAD_REQUEST, {"error": _error_message(exc)})
                 return
-            self._json(HTTPStatus.OK, {"status": "ok"})
+            self.respond(HTTPStatus.OK, {"status": "ok"})
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             parsed = urlparse(self.path)
             if parsed.path == "/metadata":
-                self._json(HTTPStatus.OK, state.metadata())
+                self.respond(HTTPStatus.OK, state.metadata())
                 return
             if parsed.path == "/health":
-                self._json(HTTPStatus.OK, state.health())
+                self.respond(HTTPStatus.OK, state.health())
                 return
             if parsed.path != "/route":
-                self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                self.respond(HTTPStatus.NOT_FOUND, {"error": f"unknown endpoint GET {parsed.path}"})
                 return
 
             try:
                 query = parse_qs(parsed.query)
+                if "topic" not in query or "partition" not in query:
+                    raise ValueError("/route needs topic and partition query parameters")
                 topic = query["topic"][0]
                 partition = int(query["partition"][0])
                 route = state.route(topic, partition)
-            except (KeyError, TypeError, ValueError) as error:
-                self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except (KeyError, TypeError, ValueError) as exc:
+                self.respond(HTTPStatus.BAD_REQUEST, {"error": _error_message(exc)})
                 return
             if route is None:
-                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no replica is alive"})
+                # Tests match this exact text.
+                self.respond(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no replica is alive"})
                 return
-            self._json(HTTPStatus.OK, route)
+            self.respond(HTTPStatus.OK, route)
 
         def log_message(self, format: str, *args: Any) -> None:
             return

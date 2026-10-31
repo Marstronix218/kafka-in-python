@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from .broker import run_broker
 from .client import ClusterClient, Consumer
-from .common import DEFAULT_ACKS, load_config
+from .common import DEFAULT_ACKS, APIError, load_config
 from .controller import run_controller
 
 
 DEFAULT_CONTROLLER_URL = "http://127.0.0.1:9000"
+
+
+def json_value(text: str) -> object:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not valid JSON (strings need quotes, e.g. '\"hello\"' or "
+            "'{\"status\":\"placed\"}')") from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     producer = sub.add_parser("produce")
     producer.add_argument("--controller", default=DEFAULT_CONTROLLER_URL)
     producer.add_argument("--topic", required=True)
-    producer.add_argument("--value", required=True, help="JSON value")
+    producer.add_argument("--value", required=True, type=json_value, help="JSON value")
     producer.add_argument("--key")
     producer.add_argument("--partition", type=int)
     producer.add_argument("--acks", type=int, default=DEFAULT_ACKS)
@@ -67,8 +77,7 @@ def consume(args: argparse.Namespace) -> None:
         consumer.commit(args.topic, args.partition, records[-1]["offset"] + 1)
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
     if args.command == "controller":
         run_controller(load_config(args.config), args.host, args.port, args.heartbeat_timeout)
     elif args.command == "broker":
@@ -76,11 +85,22 @@ def main() -> None:
                    args.data_dir)
     elif args.command == "produce":
         result = ClusterClient(args.controller).produce(
-            args.topic, json.loads(args.value), key=args.key, partition=args.partition,
+            args.topic, args.value, key=args.key, partition=args.partition,
             acks=args.acks, retries=args.retries)
         print(json.dumps(result))
     elif args.command == "consume":
         consume(args)
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        run(args)
+    except (APIError, ValueError, OSError) as exc:
+        # These are mistakes a user can fix (bad config, cluster not started, bad
+        # offset), so print the message without a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

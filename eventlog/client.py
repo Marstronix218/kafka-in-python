@@ -64,10 +64,10 @@ class ClusterClient:
         raise last_error or RuntimeError("fetch failed")
 
     def _partition_count(self, topic: str) -> int:
-        try:
-            return self.metadata()["topics"][topic]["partitions"]
-        except KeyError as exc:
-            raise ValueError("unknown topic") from exc
+        topics = self.metadata()["topics"]
+        if topic not in topics:
+            raise ValueError(f"unknown topic {topic!r} (known: {', '.join(topics)})")
+        return topics[topic]["partitions"]
 
     def _leader_url(self, topic: str, partition: int) -> str:
         route = self.route(topic, partition)
@@ -81,13 +81,18 @@ class Consumer:
     def __init__(self, client: ClusterClient, consumer_id: str, state_dir: str | Path):
         # The ID becomes a file name, so it must not be able to point outside state_dir.
         if not consumer_id or "/" in consumer_id or ".." in consumer_id:
-            raise ValueError("invalid consumer id")
+            raise ValueError(f"invalid consumer id {consumer_id!r}: it is used as a file name, "
+                             "so it must be non-empty and contain no '/' or '..'")
         self.client = client
         self.offsets_path = Path(state_dir) / f"{consumer_id}.json"
         self.offsets_path.parent.mkdir(parents=True, exist_ok=True)
         self.offsets = {}
         if self.offsets_path.exists():
-            self.offsets = json.loads(self.offsets_path.read_text())
+            try:
+                self.offsets = json.loads(self.offsets_path.read_text())
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"offset file {self.offsets_path} is not valid JSON: {exc}") from exc
 
     @staticmethod
     def _offset_key(topic: str, partition: int) -> str:
@@ -102,19 +107,25 @@ class Consumer:
 
     def commit(self, topic: str, partition: int, next_offset: int) -> None:
         # `type(...) is int` rather than isinstance, because True and False are ints too.
-        if type(next_offset) is not int or next_offset < self.position(topic, partition):
-            raise ValueError("committed offset cannot move backward; use seek")
+        if type(next_offset) is not int:
+            raise ValueError(f"offset must be an integer, got {next_offset!r}")
+        current = self.position(topic, partition)
+        if next_offset < current:
+            raise ValueError(f"cannot commit {next_offset} for {topic}:{partition}: it is behind "
+                             f"the current position {current}. Use seek to move backward.")
         # committed_offset is the last committed record, so the furthest a consumer
         # can have read up to is one past it.
         last_committed = self.client.fetch(topic, partition, next_offset, 1)["committed_offset"]
         if next_offset > last_committed + 1:
-            raise ValueError("cannot commit beyond the next available offset")
+            raise ValueError(f"cannot commit {next_offset} for {topic}:{partition}: the last "
+                             f"committed record is {last_committed}, so the highest valid "
+                             f"offset to commit is {last_committed + 1}")
         self.offsets[self._offset_key(topic, partition)] = next_offset
         self._save()
 
     def seek(self, topic: str, partition: int, next_offset: int) -> None:
         if type(next_offset) is not int or next_offset < 0:
-            raise ValueError("seek offset must be nonnegative")
+            raise ValueError(f"seek offset must be a non-negative integer, got {next_offset!r}")
         self.offsets[self._offset_key(topic, partition)] = next_offset
         self._save()
 

@@ -29,31 +29,40 @@ def validate_config(config: dict) -> dict:
     brokers = config.get("brokers")
     topics = config.get("topics")
     if not isinstance(brokers, dict) or not brokers or not isinstance(topics, dict) or not topics:
-        raise ValueError("config requires nonempty brokers and topics mappings")
+        raise ValueError('config needs non-empty "brokers" and "topics" objects')
 
     for name, url in brokers.items():
         if not isinstance(name, str) or not name:
-            raise ValueError("broker names and HTTP URLs must be nonempty")
+            raise ValueError(f"broker name must be a non-empty string, got {name!r}")
         if not isinstance(url, str) or not url.startswith("http://"):
-            raise ValueError("broker names and HTTP URLs must be nonempty")
+            raise ValueError(f"broker {name!r} URL must start with http://, got {url!r}")
 
     for name, spec in topics.items():
         # Topic names end up in file paths and in "topic:partition" keys.
         if not isinstance(name, str) or not name or "/" in name or ":" in name:
-            raise ValueError("invalid topic name")
+            raise ValueError(f"invalid topic name {name!r}: it must be non-empty and "
+                             "contain no '/' or ':'")
         if not isinstance(spec, dict):
-            raise ValueError("topic requires integer partitions and replication_factor")
+            raise ValueError(f"topic {name!r} must be an object with partitions and "
+                             "replication_factor")
         partitions = spec.get("partitions")
         replication_factor = spec.get("replication_factor")
         if type(partitions) is not int or type(replication_factor) is not int:
-            raise ValueError("topic requires integer partitions and replication_factor")
-        if partitions < 1 or not 1 <= replication_factor <= len(brokers):
-            raise ValueError("invalid partition count or replication factor")
+            raise ValueError(f"topic {name!r} needs integer partitions and replication_factor")
+        if partitions < 1:
+            raise ValueError(f"topic {name!r} needs at least 1 partition, got {partitions}")
+        if not 1 <= replication_factor <= len(brokers):
+            raise ValueError(f"topic {name!r} replication_factor must be between 1 and the "
+                             f"number of brokers ({len(brokers)}), got {replication_factor}")
     return config
 
 
 def load_config(path: str | Path) -> dict:
-    return validate_config(json.loads(Path(path).read_text()))
+    try:
+        config = json.loads(Path(path).read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"config file {path} is not valid JSON: {exc}") from exc
+    return validate_config(config)
 
 
 def replica_ids(broker_ids: list[str], partition: int, replication_factor: int) -> list[str]:
@@ -92,7 +101,11 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None,
         except (ValueError, OSError):
             message = str(exc)
         raise APIError(exc.code, message) from exc
-    except (URLError, OSError, HTTPException) as exc:
-        # A peer we cannot reach looks the same to callers as one that is up but
-        # refusing the request, so both become UNAVAILABLE.
-        raise APIError(UNAVAILABLE, str(exc)) from exc
+    except URLError as exc:
+        # The request never got there: connection refused, unknown host, and so on.
+        raise APIError(UNAVAILABLE, f"cannot reach {url}: {exc.reason}") from exc
+    except (OSError, HTTPException) as exc:
+        # The request was sent, but the reply timed out or the connection dropped.
+        # The peer may have done the work anyway (a produce may be committed), so
+        # don't word this as if the request never arrived.
+        raise APIError(UNAVAILABLE, f"no response from {url}: {exc}") from exc

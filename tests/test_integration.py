@@ -152,8 +152,8 @@ class SubprocessClusterTests(unittest.TestCase):
                 result = operation()
                 if result:
                     return result
-            except (HTTPError, URLError, ConnectionError, TimeoutError) as error:
-                last_error = error
+            except (HTTPError, URLError, ConnectionError, TimeoutError) as exc:
+                last_error = exc
             time.sleep(0.05)
         self.fail(f"condition was not met within {timeout} seconds: {last_error}")
 

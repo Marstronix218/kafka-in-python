@@ -46,7 +46,8 @@ class PartitionLog:
         self._load_records()
         self._committed_offset = self._load_committed_offset()
         if self._committed_offset > self.last_offset:
-            raise ValueError("committed offset is beyond the end of the log")
+            raise ValueError(f"{self._commit_path} says offset {self._committed_offset} is "
+                             f"committed, but the log ends at {self.last_offset}")
 
     @property
     def last_offset(self) -> int:
@@ -122,9 +123,11 @@ class PartitionLog:
 
         with self._lock:
             if offset < self._committed_offset:
-                raise ValueError("committed offset cannot move backwards")
+                raise ValueError(f"committed offset cannot move backwards from "
+                                 f"{self._committed_offset} to {offset}")
             if offset > self.last_offset:
-                raise ValueError("cannot commit beyond the end of the log")
+                raise ValueError(f"cannot commit offset {offset} beyond the end of the log "
+                                 f"({self.last_offset})")
             if offset == self._committed_offset:
                 return
 
@@ -170,7 +173,8 @@ class PartitionLog:
                     raise ValueError("log offsets must be contiguous and start at zero")
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
                 if not is_last or line.endswith(b"\n"):
-                    raise ValueError(f"corrupt log record at line {index + 1}") from None
+                    raise ValueError(
+                        f"corrupt log record at {self._data_path} line {index + 1}") from None
                 self._truncate_file_to(valid_end)
                 break
             records.append(record)
@@ -185,9 +189,10 @@ class PartitionLog:
             metadata = json.loads(self._commit_path.read_text(encoding="utf-8"))
             committed_offset = metadata["committed_offset"]
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
-            raise ValueError("invalid committed offset metadata") from None
+            raise ValueError(f"cannot read the committed offset from {self._commit_path}") from None
         if not _is_int(committed_offset) or committed_offset < -1:
-            raise ValueError("invalid committed offset metadata")
+            raise ValueError(f"{self._commit_path} holds an invalid committed offset "
+                             f"{committed_offset!r}")
         return committed_offset
 
     def _persist_committed_offset(self, committed_offset: int) -> None:
