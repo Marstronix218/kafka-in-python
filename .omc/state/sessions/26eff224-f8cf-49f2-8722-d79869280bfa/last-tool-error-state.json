@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cat -n tests/test_storage.py tests/test_controller.py | head -270; echo ======; cat -n tests/test_integration.py\",\"description\":\"Read all test files\"}",
-  "error": "Exit code 1\n     1\timport json\n     2\timport tempfile\n     3\timport unittest\n     4\tfrom pathlib import Path\n     5\t\n     6\tfrom eventlog.storage import PartitionLog\n     7\t\n     8\t\n     9\tdef record(offset: int, value: str = \"value\") -> dict:\n    10\t    return {\"offset\": offset, \"key\": \"key\", \"value\": value, \"timestamp\": 123.0}\n    11\t\n    12\t\n    13\tclass PartitionLogTests(unittest.TestCase):\n    14\t    def setUp(self):\n    15\t        self._temporary_directory = tempfile.TemporaryDirectory()\n ...",
-  "timestamp": "2026-10-31T07:59:47.687Z",
-  "retry_count": 1
-}

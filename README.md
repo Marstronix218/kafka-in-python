@@ -12,6 +12,7 @@ Requires Python 3.12 or Docker Compose. The application itself uses only the Pyt
 docker compose up --build -d
 docker compose exec broker1 python -m eventlog produce --controller http://controller:8000 --topic events --key order-1 --value '{"status":"placed"}'
 docker compose exec broker1 python -m eventlog consume --controller http://controller:8000 --topic events --partition 0 --consumer-id demo --state-dir /data/consumers --limit 10
+docker compose exec controller python -m eventlog status --controller http://localhost:8000 --watch 1
 ```
 
 The key chooses a partition by SHA-256. The produced result prints its partition; use that number for `consume`. Add `--commit` to save the next offset after printing records. The consumer offset file must stay on a persistent volume if the consumer container is recreated. In the example, broker1's `/data` volume is persistent. Commands run inside a container because the compose broker URLs use Docker network names.
@@ -25,7 +26,7 @@ python3 -m eventlog broker --config config/local.json --id b2 --port 9002 --data
 python3 -m eventlog broker --config config/local.json --id b3 --port 9003 --data-dir .data/b3
 ```
 
-Then use `python3 -m eventlog produce --topic events --value '{"hello":"world"}'` and `python3 -m eventlog consume --topic events --partition 0 --consumer-id demo --commit`. Run `python3 -m unittest discover -s tests -v` for tests.
+Then use `python3 -m eventlog produce --topic events --value '{"hello":"world"}'` and `python3 -m eventlog consume --topic events --partition 0 --consumer-id demo --commit`, and `python3 -m eventlog status` to inspect the cluster. Run `python3 -m unittest discover -s tests -v` for tests.
 
 ## Model and guarantees
 
@@ -66,9 +67,24 @@ Broker:
 
 The payload is JSON and each record is limited to 1 MiB. Internal `/replicate` and `/commit` calls carry the sending leader's ID, are rejected unless it is the current leader, and are intended for the local trusted cluster.
 
+## Inspecting the cluster
+
+`status` puts the controller's view next to every broker's own log:
+
+```text
+brokers   b1 DOWN   b2 up   b3 up
+
+partition   leader  b1        b2        b3
+events:0    b2      down      *5/5      5/5
+events:1    b2      down      *1/1      1/1
+events:2    b3      down      1/1       *1/1
+```
+
+Each cell is *records held / records committed* on that broker, and `*` marks the leader. A follower with a smaller count has missed records. A leader holding more records than it has committed has an uncommitted write from a produce that failed its `acks`. `--watch 1` redraws the table every second, which is handy in a second terminal while stopping brokers.
+
 ## Failure demonstration
 
-Produce a few records and note their partition and current leader in `/route`. Stop that broker with `docker compose stop broker1` (or whichever broker leads the partition). Within the heartbeat timeout, `/route` promotes a surviving replica. Fetch the old records and produce another event. Start the stopped broker again with `docker compose start broker1`; it rejoins as a follower but does not yet catch up on the records it missed.
+Run `status --watch 1` in one terminal. In another, produce a few records to partition 0 and kill its leader with `docker compose kill broker1`. Within the 2-second heartbeat timeout, b1 shows `DOWN` and b2 becomes the leader. Old records are still readable and new writes succeed. Kill broker2 as well: b3 leads alone, and an `acks=2` produce returns `insufficient replicas`. The leader's cell shows one more record held than committed, and consumers don't see that record. Start both brokers again with `docker compose start broker1 broker2`. They reload their logs from disk and rejoin as followers, but they stay behind because catch-up isn't implemented yet. If you now kill broker3, the stale b1 is promoted and acknowledged records are lost. That is the first limitation listed above.
 
 ## Progress
 

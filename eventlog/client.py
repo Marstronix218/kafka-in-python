@@ -11,11 +11,13 @@ import time
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .common import DEFAULT_ACKS, NOT_LEADER, UNAVAILABLE, APIError, partition_for_key, request_json
+from .common import (DEFAULT_ACKS, NOT_LEADER, UNAVAILABLE, APIError, partition_for_key,
+                     replica_ids, request_json)
 
 
 PRODUCE_TIMEOUT_SECONDS = 3.0
 FETCH_ATTEMPTS = 3
+STATUS_TIMEOUT_SECONDS = 0.5
 
 
 class ClusterClient:
@@ -68,6 +70,34 @@ class ClusterClient:
                 if exc.status != NOT_LEADER:
                     raise
         raise last_error or RuntimeError("fetch failed")
+
+    def cluster_status(self) -> dict:
+        """The controller's view (alive brokers, partition leaders) next to each
+        replica's own log, for inspecting the cluster by hand. A replica that
+        can't be reached shows as None, and a partition with no live replica has
+        no leader."""
+        metadata = self.metadata()
+        brokers = metadata["brokers"]
+        alive = request_json(self.controller_url + "/health")["alive_brokers"]
+        partitions = []
+        for topic, spec in metadata["topics"].items():
+            for partition in range(spec["partitions"]):
+                try:
+                    leader = self.route(topic, partition)["leader"]
+                except APIError:
+                    leader = None
+                logs = {}
+                for broker_id in replica_ids(list(brokers), partition,
+                                             spec["replication_factor"]):
+                    query = urlencode({"topic": topic, "partition": partition})
+                    try:
+                        logs[broker_id] = request_json(brokers[broker_id] + "/status?" + query,
+                                                       timeout=STATUS_TIMEOUT_SECONDS)
+                    except APIError:
+                        logs[broker_id] = None
+                partitions.append({"topic": topic, "partition": partition,
+                                   "leader": leader, "replicas": logs})
+        return {"brokers": brokers, "alive_brokers": alive, "partitions": partitions}
 
     def _partition_count(self, topic: str) -> int:
         topics = self.metadata()["topics"]

@@ -306,6 +306,24 @@ class SubprocessClusterTests(unittest.TestCase):
         self.assertNotEqual(0, rejected.returncode)
         self.assertIn("insufficient replicas", rejected.stderr)
 
+    def test_status_shows_new_leader_and_stopped_broker(self) -> None:
+        for index in range(2):
+            self._produce({"sequence": index})
+        original_leader = self._route()["leader"]
+
+        self._stop_broker(original_leader)
+        new_route = self._wait_for(
+            lambda: self._route_after_failover(original_leader),
+            timeout=5,
+        )
+        output = self._cli("status", "--controller", self.controller_url).stdout
+
+        row = next(line for line in output.splitlines() if line.startswith(f"{TOPIC}:0 "))
+        self.assertEqual(new_route["leader"], row.split()[1])
+        self.assertIn("down", row)
+        self.assertIn("*2/2", row)
+        self.assertIn(f"{original_leader} DOWN", output)
+
 
 if __name__ == "__main__":
     unittest.main()

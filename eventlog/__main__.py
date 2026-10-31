@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 
 from .broker import run_broker
 from .client import ClusterClient, Consumer
@@ -61,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     consumer.add_argument("--commit", action="store_true",
                           help="commit next offset after printing records")
     consumer.add_argument("--seek", type=int)
+
+    status = sub.add_parser("status", help="show brokers, leaders, and each replica's log")
+    status.add_argument("--controller", default=DEFAULT_CONTROLLER_URL)
+    status.add_argument("--watch", type=float, metavar="SECONDS",
+                        help="redraw every SECONDS until interrupted")
     return parser
 
 
@@ -77,6 +83,52 @@ def consume(args: argparse.Namespace) -> None:
         consumer.commit(args.topic, args.partition, records[-1]["offset"] + 1)
 
 
+def format_status(status: dict) -> str:
+    alive = set(status["alive_brokers"])
+    broker_ids = list(status["brokers"])
+    lines = ["brokers   " + "   ".join(
+        f"{broker_id} {'up' if broker_id in alive else 'DOWN'}" for broker_id in broker_ids), ""]
+
+    # Each cell is "records held / records committed" in that broker's own log.
+    # The leader's cell is starred. A follower behind the leader has missed records.
+    lines.append(f"{'partition':<12}{'leader':<8}" + "".join(f"{b:<10}" for b in broker_ids))
+    for entry in status["partitions"]:
+        cells = []
+        for broker_id in broker_ids:
+            if broker_id not in entry["replicas"]:
+                cell = ""
+            elif entry["replicas"][broker_id] is None:
+                cell = "down"
+            else:
+                log = entry["replicas"][broker_id]
+                cell = f"{log['last_offset'] + 1}/{log['committed_offset'] + 1}"
+                if broker_id == entry["leader"]:
+                    cell = "*" + cell
+            cells.append(f"{cell:<10}")
+        name = f"{entry['topic']}:{entry['partition']}"
+        lines.append(f"{name:<12}{entry['leader'] or 'NONE':<8}" + "".join(cells))
+    lines += ["", "cells: records held / committed on that broker; * = leader"]
+    return "\n".join(lines)
+
+
+def show_status(args: argparse.Namespace) -> None:
+    client = ClusterClient(args.controller)
+    if args.watch is None:
+        print(format_status(client.cluster_status()))
+        return
+    try:
+        while True:
+            try:
+                text = format_status(client.cluster_status())
+            except APIError as exc:
+                text = f"error: {exc}"
+            # Clear the screen and redraw at the top, like watch(1).
+            print("\033[2J\033[H" + time.strftime("%H:%M:%S") + "\n\n" + text, flush=True)
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        pass
+
+
 def run(args: argparse.Namespace) -> None:
     if args.command == "controller":
         run_controller(load_config(args.config), args.host, args.port, args.heartbeat_timeout)
@@ -90,6 +142,8 @@ def run(args: argparse.Namespace) -> None:
         print(json.dumps(result))
     elif args.command == "consume":
         consume(args)
+    elif args.command == "status":
+        show_status(args)
 
 
 def main() -> None:
