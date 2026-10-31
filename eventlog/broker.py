@@ -1,5 +1,7 @@
 """A broker process. It stores the partitions assigned to it, leads some of them,
-and copies each new record to the followers before acknowledging the write."""
+and copies each new record to the followers before acknowledging the write.
+
+Kafka references for this module are listed in REFERENCES.md."""
 
 from __future__ import annotations
 
@@ -65,6 +67,7 @@ class BrokerState:
         return request_json(self.controller_url + "/route?" + query)
 
     def _require_leader(self, topic: str, partition: int) -> dict:
+        # Kafka reference: brokers answer non-leader requests with NOT_LEADER_OR_FOLLOWER.
         route = self.route(topic, partition)
         if route["leader"] != self.broker_id:
             raise APIError(NOT_LEADER, f"broker {self.broker_id} is not the leader for "
@@ -74,10 +77,12 @@ class BrokerState:
     def _require_sent_by_leader(self, body: dict, topic: str, partition: int) -> None:
         # A broker that has just lost leadership may still be sending. Only the broker
         # the controller names right now is allowed to write to followers.
+        # Kafka reference: leader epochs and FENCED_LEADER_EPOCH do this job in Kafka.
         if body.get("leader") != self.route(topic, partition)["leader"]:
             raise APIError(NOT_LEADER, "request is not from the current leader")
 
     def heartbeat_loop(self) -> None:
+        # Kafka reference: BrokerHeartbeat requests to the controller (KIP-631).
         while not self.stop_event.is_set():
             try:
                 request_json(self.controller_url + "/heartbeat", "POST",
@@ -88,6 +93,9 @@ class BrokerState:
             self.stop_event.wait(HEARTBEAT_INTERVAL_SECONDS)
 
     def produce(self, body: dict) -> dict:
+        # Kafka reference: ReplicaManager.appendRecords -> Partition.appendRecordsToLeader,
+        # then Partition.maybeIncrementLeaderHW; producer "acks" (ProducerConfig ACKS_DOC).
+        # Unlike Kafka, the leader pushes to followers instead of followers fetching.
         topic, partition, key, acks = self._validate_produce(body)
         with self._lock_for(topic, partition):
             route = self._require_leader(topic, partition)
@@ -159,6 +167,7 @@ class BrokerState:
             return False
 
     def replicate(self, body: dict) -> dict:
+        # Kafka reference: the follower side of ReplicaFetcherThread / AbstractFetcherThread.
         topic, partition = _topic_and_partition(body)
         with self._lock_for(topic, partition):
             log = self.log(topic, partition)
@@ -187,6 +196,7 @@ class BrokerState:
             return {"committed_offset": log.committed_offset}
 
     def fetch(self, topic: str, partition: int, offset: int, limit: int) -> dict:
+        # Kafka reference: ReplicaManager.fetchMessages (reads stop at the high watermark).
         with self._lock_for(topic, partition):
             self._require_leader(topic, partition)
             if offset < 0 or not 1 <= limit <= MAX_FETCH_LIMIT:

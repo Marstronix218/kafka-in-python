@@ -1,5 +1,7 @@
 """Client side of the event log: a producer that finds partition leaders through
-the controller, and a single consumer that keeps its own offsets on disk."""
+the controller, and a single consumer that keeps its own offsets on disk.
+
+Kafka references for this module are listed in REFERENCES.md."""
 
 from __future__ import annotations
 
@@ -17,6 +19,9 @@ FETCH_ATTEMPTS = 3
 
 
 class ClusterClient:
+    """Kafka reference: Metadata.currentLeader (Java client), kafka-python
+    ClusterMetadata.leader_for_partition, confluent-kafka-python PartitionMetadata."""
+
     def __init__(self, controller_url: str):
         self.controller_url = controller_url.rstrip("/")
 
@@ -42,6 +47,7 @@ class ClusterClient:
                 last_error = exc
                 # Both errors can clear on their own: the controller promotes a new
                 # leader, or a follower comes back. Anything else is the caller's problem.
+                # Kafka reference: Sender retries retriable errors after Metadata.requestUpdate.
                 if exc.status not in (NOT_LEADER, UNAVAILABLE) or attempt == retries:
                     raise
                 time.sleep(min(0.2 * (attempt + 1), 0.8))
@@ -76,7 +82,12 @@ class ClusterClient:
 
 class Consumer:
     """A consumer's offsets are next-to-read positions, stored as one JSON file
-    per consumer ID ({"events:0": 12, ...}) on the consumer's own disk."""
+    per consumer ID ({"events:0": 12, ...}) on the consumer's own disk.
+
+    Kafka reference: KafkaConsumer.position / seek / commit (Java client,
+    kafka-python, confluent-kafka-python). Kafka's committed offset is also
+    "the offset of the next message that your application will read".
+    """
 
     def __init__(self, client: ClusterClient, consumer_id: str, state_dir: str | Path):
         # The ID becomes a file name, so it must not be able to point outside state_dir.

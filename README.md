@@ -2,7 +2,7 @@
 
 A Python distributed event log with three independent HTTP brokers, partitioned append-only storage, synchronous leader-to-follower replication with configurable acknowledgments, and a controller that promotes a surviving replica when a leader stops responding.
 
-This repository is at the end of project week 8 (see [Progress](#progress)).
+This repository is at the end of project week 8 (see [Progress](#progress)). [REFERENCES.md](REFERENCES.md) lists the Kafka source files and docs that each part of the code is based on.
 
 ## Quick start
 

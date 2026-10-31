@@ -1,4 +1,6 @@
-"""Cluster metadata, heartbeat tracking, and partition leader routing."""
+"""Cluster metadata, heartbeat tracking, and partition leader routing.
+
+Kafka references for this module are listed in REFERENCES.md."""
 
 from __future__ import annotations
 
@@ -49,6 +51,7 @@ class ControllerState:
         return replica_ids(list(self.brokers), partition, int(topic_config["replication_factor"]))
 
     def heartbeat(self, broker_id: str) -> None:
+        # Kafka reference: BrokerHeartbeatManager (session timeout, KIP-631).
         if broker_id not in self.brokers:
             raise KeyError(f"unknown broker {broker_id!r} (known: {', '.join(self.brokers)})")
 
@@ -71,6 +74,8 @@ class ControllerState:
 
             # Keep a live leader so a recovered preferred replica does not
             # preempt it; otherwise fail over in assignment order.
+            # Kafka reference: PartitionChangeBuilder.electLeader, which also
+            # requires the new leader to be in the ISR. This code doesn't yet.
             leader = self._leaders.get(key)
             if leader not in alive:
                 leader = alive[0]

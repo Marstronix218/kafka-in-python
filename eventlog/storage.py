@@ -1,4 +1,6 @@
-"""Durable storage for a single topic partition."""
+"""Durable storage for a single topic partition.
+
+Kafka references for this module are listed in REFERENCES.md."""
 
 from __future__ import annotations
 
@@ -24,6 +26,9 @@ class PartitionLog:
     Entries may exist beyond the committed high watermark while replication is in
     progress.  ``read`` exposes only committed entries; ``get`` can inspect the
     complete local replica.
+
+    Kafka reference: UnifiedLog and LogSegment (storage/internals/log); the
+    committed offset plays the role of UnifiedLog.highWatermark().
     """
 
     _REQUIRED_FIELDS = frozenset({"offset", "key", "value", "timestamp"})
@@ -116,7 +121,10 @@ class PartitionLog:
             return [self._copy_record(record) for record in self._records[start:stop]]
 
     def commit(self, offset: int) -> None:
-        """Durably advance the committed high watermark."""
+        """Durably advance the committed high watermark.
+
+        Kafka reference: the high watermark checkpoint (CheckpointFile).
+        """
 
         if not _is_int(offset) or offset < -1:
             raise ValueError("committed offset must be an integer greater than or equal to -1")
@@ -135,7 +143,10 @@ class PartitionLog:
             self._committed_offset = offset
 
     def truncate_from(self, offset: int) -> None:
-        """Durably remove ``offset`` and all later records outside the committed prefix."""
+        """Durably remove ``offset`` and all later records outside the committed prefix.
+
+        Kafka reference: Partition.truncateTo / UnifiedLog.truncateTo.
+        """
 
         self._validate_offset(offset)
         with self._lock:
@@ -162,6 +173,7 @@ class PartitionLog:
         # A crash in the middle of append() can leave the final line without its
         # newline. That record was never acknowledged, so it is cut off. Damage
         # anywhere else means the file is corrupt, and we refuse to start.
+        # Kafka reference: LogSegment.recover() and LogLoader.
         for index, line in enumerate(lines):
             is_last = index == len(lines) - 1
             try:
@@ -217,6 +229,8 @@ class PartitionLog:
             os.fsync(stream.fileno())
 
     def _atomic_replace(self, path: Path, contents: bytes) -> None:
+        # Kafka reference: CheckpointFile.write() (temp file, fsync, then
+        # Utils.atomicMoveWithFallback).
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             with temporary.open("wb") as stream:

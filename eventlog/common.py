@@ -1,4 +1,6 @@
-"""Configuration, replica placement, and the HTTP helper shared by every process."""
+"""Configuration, replica placement, and the HTTP helper shared by every process.
+
+Kafka references for this module are listed in REFERENCES.md."""
 
 from __future__ import annotations
 
@@ -11,10 +13,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+# Kafka reference: producer max.request.size, default 1048576 (ProducerConfig.java).
 MAX_RECORD_BYTES = 1_048_576
 DEFAULT_ACKS = 2
 
 # Two HTTP codes carry a narrower meaning inside the cluster, and clients retry on them.
+# Kafka reference: Errors.NOT_LEADER_OR_FOLLOWER and NOT_ENOUGH_REPLICAS (Errors.java).
 NOT_LEADER = HTTPStatus.CONFLICT  # 409: this broker is not the leader for the partition
 UNAVAILABLE = HTTPStatus.SERVICE_UNAVAILABLE  # 503: can't reach it, or too few replicas for acks
 
@@ -71,6 +75,9 @@ def replica_ids(broker_ids: list[str], partition: int, replication_factor: int) 
     Partition p starts at broker p and wraps around, so leadership is spread
     across the cluster. The broker and the controller both call this, which is
     what keeps their views of who holds what in agreement.
+
+    Kafka reference: StripedReplicaPlacer (round-robin placement) and
+    PartitionChangeBuilder.electLeader (first replica is the preferred leader).
     """
     count = min(replication_factor, len(broker_ids))
     return [broker_ids[(partition + i) % len(broker_ids)] for i in range(count)]
@@ -80,6 +87,8 @@ def partition_for_key(key: str | None, partition_count: int, value: object | Non
     # Python's built-in hash() is salted per process, so two producers would disagree.
     # SHA-256 gives every process the same answer. Records without a key are placed
     # by their value instead.
+    # Kafka reference: BuiltInPartitioner.partitionForKey (murmur2(key) % partitions),
+    # kafka-python DefaultPartitioner, librdkafka's "partitioner" setting.
     if key is not None:
         material = key
     else:
