@@ -21,12 +21,21 @@ DEFAULT_ACKS = 2
 # Kafka reference: Errors.NOT_LEADER_OR_FOLLOWER and NOT_ENOUGH_REPLICAS (Errors.java).
 NOT_LEADER = HTTPStatus.CONFLICT  # 409: this broker is not the leader for the partition
 UNAVAILABLE = HTTPStatus.SERVICE_UNAVAILABLE  # 503: can't reach it, or too few replicas for acks
+# A producer sequence the leader can't accept: a gap after the last one it stored, or a
+# number older than the ones it keeps. Not 409, because clients retry 409 and sending
+# the same sequence again can't fix this.
+# Kafka reference: Errors.OUT_OF_ORDER_SEQUENCE_NUMBER and DUPLICATE_SEQUENCE_NUMBER.
+BAD_SEQUENCE = HTTPStatus.UNPROCESSABLE_ENTITY  # 422
 
 
 class APIError(Exception):
-    def __init__(self, status: int, message: str):
+    """An HTTP error reply. ``fields`` are extra keys sent next to "error" in the JSON
+    body, such as the follower's offsets in a /replicate conflict."""
+
+    def __init__(self, status: int, message: str, fields: dict | None = None):
         super().__init__(message)
         self.status = status
+        self.fields = fields or {}
 
 
 def validate_config(config: dict) -> dict:
@@ -106,10 +115,13 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None,
             return json.loads(response.read())
     except HTTPError as exc:
         try:
-            message = json.loads(exc.read()).get("error", str(exc))
+            reply = json.loads(exc.read())
         except (ValueError, OSError):
-            message = str(exc)
-        raise APIError(exc.code, message) from exc
+            reply = None
+        if not isinstance(reply, dict):
+            raise APIError(exc.code, str(exc)) from exc
+        fields = {name: value for name, value in reply.items() if name != "error"}
+        raise APIError(exc.code, reply.get("error", str(exc)), fields) from exc
     except URLError as exc:
         # The request never got there: connection refused, unknown host, and so on.
         raise APIError(UNAVAILABLE, f"cannot reach {url}: {exc.reason}") from exc

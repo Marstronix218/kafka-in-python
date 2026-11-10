@@ -1,0 +1,58 @@
+{
+  "config": {
+    "events": 10000,
+    "partitions": 3,
+    "acks": 1,
+    "threads": 6,
+    "value_size": 100,
+    "fault": "none",
+    "brokers": 3,
+    "replication_factor": 3,
+    "retries": 10,
+    "heartbeat_timeout": 2.0
+  },
+  "metrics": {
+    "acknowledged": 9993,
+    "failed": 7,
+    "stored": 9994,
+    "duplicates": 0,
+    "lost": 0,
+    "failed_but_stored": 1,
+    "unexpected": 0,
+    "replica_mismatches": 0,
+    "duplicate_replies": 4,
+    "produce_seconds": 33.7,
+    "throughput_per_second": 296.5,
+    "latency_ms": {
+      "p50": 10.4,
+      "p95": 15.92,
+      "p99": 36.86,
+      "max": 6160.7
+    },
+    "latency_ms_mean": 14.97,
+    "isr_lag_max": 1,
+    "isr_lag_mean": 0.211,
+    "replica_lag_max": 246,
+    "lag_samples": 242,
+    "min_isr_size": 1,
+    "short_isr_samples": 20,
+    "leader_changes": 0,
+    "errors": {
+      "cannot reach http://127.0.0.1:54477/route?topic=events&partition=2: [Errno 49] Can't assign requested address": 3,
+      "cannot reach http://127.0.0.1:54477/route?topic=events&partition=1: [Errno 49] Can't assign requested address": 2,
+      "cannot reach http://127.0.0.1:54477/route?topic=events&partition=0: [Errno 49] Can't assign requested address": 2
+    }
+  },
+  "timeline": [],
+  "started_at": "2026-11-10T10:11:24+00:00",
+  "wall_seconds": 34.4,
+  "environment": {
+    "git_commit": "e03e614",
+    "git_dirty": true,
+    "os": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu": "Apple M2",
+    "cpu_count": 8,
+    "python": "3.11.3"
+  }
+}

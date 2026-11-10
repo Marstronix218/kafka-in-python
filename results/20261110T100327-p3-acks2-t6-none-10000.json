@@ -1,0 +1,54 @@
+{
+  "config": {
+    "events": 10000,
+    "partitions": 3,
+    "acks": 2,
+    "threads": 6,
+    "value_size": 100,
+    "fault": "none",
+    "brokers": 3,
+    "replication_factor": 3,
+    "retries": 10,
+    "heartbeat_timeout": 2.0
+  },
+  "metrics": {
+    "acknowledged": 10000,
+    "failed": 0,
+    "stored": 10000,
+    "duplicates": 0,
+    "lost": 0,
+    "failed_but_stored": 0,
+    "unexpected": 0,
+    "replica_mismatches": 0,
+    "duplicate_replies": 0,
+    "produce_seconds": 28.425,
+    "throughput_per_second": 351.8,
+    "latency_ms": {
+      "p50": 11.69,
+      "p95": 30.65,
+      "p99": 84.03,
+      "max": 1536.55
+    },
+    "latency_ms_mean": 17.03,
+    "isr_lag_max": 1,
+    "isr_lag_mean": 0.253,
+    "replica_lag_max": 1,
+    "lag_samples": 288,
+    "min_isr_size": 3,
+    "short_isr_samples": 0,
+    "leader_changes": 0,
+    "errors": {}
+  },
+  "timeline": [],
+  "started_at": "2026-11-10T10:03:27+00:00",
+  "wall_seconds": 29.1,
+  "environment": {
+    "git_commit": "e03e614",
+    "git_dirty": true,
+    "os": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu": "Apple M2",
+    "cpu_count": 8,
+    "python": "3.11.3"
+  }
+}

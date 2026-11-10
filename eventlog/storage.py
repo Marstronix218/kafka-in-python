@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 
+# Kafka reference: ProducerStateManager (keeps the last 5 batches per producer).
+PRODUCER_STATE_ENTRIES = 5
+
+
 def _is_int(value: object) -> bool:
     # bool is a subclass of int, and True must not pass as offset 1.
     return isinstance(value, int) and not isinstance(value, bool)
@@ -26,6 +30,10 @@ class PartitionLog:
     Entries may exist beyond the committed high watermark while replication is in
     progress.  ``read`` exposes only committed entries; ``get`` can inspect the
     complete local replica.
+
+    Records may carry ``producer_id`` and ``sequence``. The log keeps the last
+    sequences and offsets of each producer, built from the records themselves, so
+    any replica that becomes leader can detect a retried record.
 
     Kafka reference: UnifiedLog and LogSegment (storage/internals/log); the
     committed offset plays the role of UnifiedLog.highWatermark().
@@ -47,8 +55,11 @@ class PartitionLog:
         self._commit_path = self._directory / f"partition-{partition}.commit.json"
         self._lock = threading.RLock()
         self._records: list[dict[str, Any]] = []
+        # producer_id -> [(sequence, offset), ...] for its last records, oldest first.
+        self._producers: dict[str, list[tuple[int, int]]] = {}
 
         self._load_records()
+        self._rebuild_producer_state()
         self._committed_offset = self._load_committed_offset()
         if self._committed_offset > self.last_offset:
             raise ValueError(f"{self._commit_path} says offset {self._committed_offset} is "
@@ -95,6 +106,7 @@ class PartitionLog:
                 stream.flush()
                 os.fsync(stream.fileno())
             self._records.append(canonical)
+            self._track_producer(canonical)
 
     def get(self, offset: int) -> dict[str, Any] | None:
         """Return a stored entry, including an uncommitted entry, if present."""
@@ -119,6 +131,25 @@ class PartitionLog:
             if start >= stop:
                 return []
             return [self._copy_record(record) for record in self._records[start:stop]]
+
+    def read_range(self, start: int, limit: int) -> list[dict[str, Any]]:
+        """Read at most ``limit`` stored entries from ``start``, committed or not.
+
+        The leader uses this to send records to followers.
+        """
+
+        self._validate_offset(start)
+        if not _is_int(limit) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            return [self._copy_record(record) for record in self._records[start:start + limit]]
+
+    def producer_sequences(self, producer_id: str) -> list[tuple[int, int]]:
+        """Return (sequence, offset) for the producer's last records in this log, oldest
+        first, at most PRODUCER_STATE_ENTRIES of them. Empty if the log has none."""
+
+        with self._lock:
+            return list(self._producers.get(producer_id, ()))
 
     def commit(self, offset: int) -> None:
         """Durably advance the committed high watermark.
@@ -159,6 +190,9 @@ class PartitionLog:
             contents = b"".join(self._encode(record) for record in retained)
             self._atomic_replace(self._data_path, contents)
             self._records = retained
+            # A producer's older records may now be its latest, so scan again. This
+            # costs as much as the rewrite above, which already reads every record.
+            self._rebuild_producer_state()
 
     def _load_records(self) -> None:
         if not self._data_path.exists():
@@ -193,6 +227,19 @@ class PartitionLog:
             valid_end += len(line)
 
         self._records = records
+
+    def _rebuild_producer_state(self) -> None:
+        self._producers = {}
+        for record in self._records:
+            self._track_producer(record)
+
+    def _track_producer(self, record: dict[str, Any]) -> None:
+        producer_id, sequence = record.get("producer_id"), record.get("sequence")
+        if not isinstance(producer_id, str) or not _is_int(sequence):
+            return
+        entries = self._producers.setdefault(producer_id, [])
+        entries.append((sequence, record["offset"]))
+        del entries[:-PRODUCER_STATE_ENTRIES]
 
     def _load_committed_offset(self) -> int:
         if not self._commit_path.exists():

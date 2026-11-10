@@ -10,6 +10,10 @@ def record(offset: int, value: str = "value") -> dict:
     return {"offset": offset, "key": "key", "value": value, "timestamp": 123.0}
 
 
+def producer_record(offset: int, producer_id: str, sequence: int) -> dict:
+    return {**record(offset), "producer_id": producer_id, "sequence": sequence}
+
+
 class PartitionLogTests(unittest.TestCase):
     def setUp(self):
         self._temporary_directory = tempfile.TemporaryDirectory()
@@ -115,6 +119,38 @@ class PartitionLogTests(unittest.TestCase):
 
         self.assertEqual(log.last_offset, 0)
         self.assertEqual(log.committed_offset, 0)
+
+    def test_producer_sequences_are_rebuilt_from_the_log_on_restart(self):
+        log = PartitionLog(self.data_dir, "events", 0)
+        log.append(record(0))
+        for offset in range(1, 8):
+            log.append(producer_record(offset, "p", offset + 9))
+        log.append(producer_record(8, "q", 0))
+        # Only the last 5 records of each producer are kept.
+        expected = [(12, 3), (13, 4), (14, 5), (15, 6), (16, 7)]
+        self.assertEqual(expected, log.producer_sequences("p"))
+
+        restarted = PartitionLog(self.data_dir, "events", 0)
+
+        self.assertEqual(expected, restarted.producer_sequences("p"))
+        self.assertEqual([(0, 8)], restarted.producer_sequences("q"))
+        self.assertEqual([], restarted.producer_sequences("unknown"))
+
+    def test_truncation_and_replacement_roll_producer_sequences_back(self):
+        log = PartitionLog(self.data_dir, "events", 0)
+        for offset in range(7):
+            log.append(producer_record(offset, "p", offset))
+        log.commit(1)
+
+        log.truncate_from(3)
+        self.assertEqual([(0, 0), (1, 1), (2, 2)], log.producer_sequences("p"))
+
+        # A different record at offset 2 replaces the old one and its sequence.
+        log.append(producer_record(2, "q", 40))
+        self.assertEqual([(0, 0), (1, 1)], log.producer_sequences("p"))
+        self.assertEqual([(40, 2)], log.producer_sequences("q"))
+        self.assertEqual([(40, 2)], PartitionLog(self.data_dir, "events", 0)
+                         .producer_sequences("q"))
 
 
 if __name__ == "__main__":

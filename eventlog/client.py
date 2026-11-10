@@ -1,5 +1,6 @@
-"""Client side of the event log: a producer that finds partition leaders through
-the controller, and a single consumer that keeps its own offsets on disk.
+"""Client side of the event log: a cluster client that finds partition leaders through
+the controller, an idempotent producer, and a single consumer that keeps its own
+offsets on disk.
 
 Kafka references for this module are listed in REFERENCES.md."""
 
@@ -7,12 +8,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .common import (DEFAULT_ACKS, NOT_LEADER, UNAVAILABLE, APIError, partition_for_key,
-                     replica_ids, request_json)
+from .common import (DEFAULT_ACKS, NOT_LEADER, UNAVAILABLE, APIError,
+                     partition_for_key, replica_ids, request_json)
 
 
 PRODUCE_TIMEOUT_SECONDS = 3.0
@@ -26,6 +29,8 @@ class ClusterClient:
 
     def __init__(self, controller_url: str):
         self.controller_url = controller_url.rstrip("/")
+        self._lock = threading.Lock()
+        self._producer: Producer | None = None
 
     def metadata(self) -> dict:
         return request_json(self.controller_url + "/metadata")
@@ -35,10 +40,31 @@ class ClusterClient:
         return request_json(self.controller_url + "/route?" + query)
 
     def produce(self, topic: str, value: object, key: str | None = None,
-                partition: int | None = None, acks: int = DEFAULT_ACKS, retries: int = 3) -> dict:
+                partition: int | None = None, acks: int = DEFAULT_ACKS, retries: int = 3,
+                producer_id: str | None = None, sequence: int | None = None) -> dict:
+        """Write one record and return the leader's reply (topic, partition, offset, acks,
+        producer_id, sequence, duplicate).
+
+        Without producer_id the record goes through this client's own Producer, so all
+        such calls share one producer id and are numbered per partition. With
+        producer_id, exactly that id and sequence are sent. Every retry resends the
+        same pair, so a retry after a lost reply gets the stored offset back with
+        duplicate=true instead of storing a second copy.
+        Raises APIError when the last attempt fails.
+        """
+        if producer_id is None:
+            if sequence is not None:
+                raise ValueError("a sequence needs a producer_id")
+            with self._lock:
+                if self._producer is None:
+                    self._producer = Producer(self)
+            return self._producer.produce(topic, value, key, partition, acks, retries)
+        if sequence is None:
+            raise ValueError("a producer_id needs a sequence")
         if partition is None:
             partition = partition_for_key(key, self._partition_count(topic), value)
-        body = {"topic": topic, "partition": partition, "key": key, "value": value, "acks": acks}
+        body = {"topic": topic, "partition": partition, "key": key, "value": value, "acks": acks,
+                "producer_id": producer_id, "sequence": sequence}
 
         last_error: Exception | None = None
         for attempt in range(retries + 1):
@@ -71,11 +97,24 @@ class ClusterClient:
                     raise
         raise last_error or RuntimeError("fetch failed")
 
+    def faults(self, broker_id: str) -> dict:
+        """Return a broker's fault rules as {"broker_id": ..., "rules": [...]}."""
+        return request_json(self._broker_url(broker_id) + "/faults")
+
+    def set_faults(self, broker_id: str, rules: list[dict], seed: int | None = None) -> dict:
+        """Replace a broker's fault rules (an empty list clears them) and return the new
+        table. A seed makes the broker's probability rolls repeatable."""
+        body: dict = {"rules": rules}
+        if seed is not None:
+            body["seed"] = seed
+        return request_json(self._broker_url(broker_id) + "/faults", "POST", body)
+
     def cluster_status(self) -> dict:
-        """The controller's view (alive brokers, partition leaders) next to each
-        replica's own log, for inspecting the cluster by hand. A replica that
-        can't be reached shows as None, and a partition with no live replica has
-        no leader."""
+        """The controller's view (alive brokers, partition leaders, leader epochs, ISRs)
+        next to each replica's own log, for inspecting the cluster by hand. A replica
+        that can't be reached shows as None. A partition the controller can't route
+        has no leader, no epoch, and an empty ISR. "faults" maps each broker to its
+        fault rules, or None if it can't be reached."""
         metadata = self.metadata()
         brokers = metadata["brokers"]
         alive = request_json(self.controller_url + "/health")["alive_brokers"]
@@ -83,9 +122,9 @@ class ClusterClient:
         for topic, spec in metadata["topics"].items():
             for partition in range(spec["partitions"]):
                 try:
-                    leader = self.route(topic, partition)["leader"]
+                    route = self.route(topic, partition)
                 except APIError:
-                    leader = None
+                    route = {"leader": None, "leader_epoch": None, "isr": []}
                 logs = {}
                 for broker_id in replica_ids(list(brokers), partition,
                                              spec["replication_factor"]):
@@ -96,8 +135,18 @@ class ClusterClient:
                     except APIError:
                         logs[broker_id] = None
                 partitions.append({"topic": topic, "partition": partition,
-                                   "leader": leader, "replicas": logs})
-        return {"brokers": brokers, "alive_brokers": alive, "partitions": partitions}
+                                   "leader": route["leader"],
+                                   "leader_epoch": route["leader_epoch"],
+                                   "isr": route["isr"], "replicas": logs})
+        faults = {}
+        for broker_id, url in brokers.items():
+            try:
+                faults[broker_id] = request_json(url + "/faults",
+                                                 timeout=STATUS_TIMEOUT_SECONDS)["rules"]
+            except APIError:
+                faults[broker_id] = None
+        return {"brokers": brokers, "alive_brokers": alive, "partitions": partitions,
+                "faults": faults}
 
     def _partition_count(self, topic: str) -> int:
         topics = self.metadata()["topics"]
@@ -108,6 +157,82 @@ class ClusterClient:
     def _leader_url(self, topic: str, partition: int) -> str:
         route = self.route(topic, partition)
         return route["brokers"][route["leader"]]
+
+    def _broker_url(self, broker_id: str) -> str:
+        brokers = self.metadata()["brokers"]
+        if broker_id not in brokers:
+            raise ValueError(f"unknown broker {broker_id!r} (known: {', '.join(brokers)})")
+        return brokers[broker_id]
+
+
+class Producer:
+    """Writes records under one producer id, numbering them per (topic, partition).
+
+    Each record gets the partition's next sequence, and retries resend that same
+    sequence, so a record is stored at most once even when replies are lost or the
+    leader changes. Safe to share between threads. Writes to one partition run one
+    at a time, so the leader always sees a sequence after the one before it. Writes
+    to different partitions run in parallel.
+
+    producer_id is the id every partition starts with. A partition moves to a new id
+    after a failed write (see produce), so read the id of a record from the reply.
+
+    Kafka reference: TransactionManager (producer id and per-partition sequence numbers).
+    """
+
+    def __init__(self, client: ClusterClient, producer_id: str | None = None,
+                 first_sequence: int = 0):
+        if type(first_sequence) is not int or first_sequence < 0:
+            raise ValueError(f"first_sequence must be a non-negative integer, "
+                             f"got {first_sequence!r}")
+        self.client = client
+        self.producer_id = producer_id or uuid.uuid4().hex
+        self.first_sequence = first_sequence
+        self._lock = threading.Lock()
+        self._partitions: dict[tuple[str, int], dict] = {}
+        self._partition_counts: dict[str, int] = {}
+
+    def produce(self, topic: str, value: object, key: str | None = None,
+                partition: int | None = None, acks: int = DEFAULT_ACKS, retries: int = 3) -> dict:
+        """Write one record and return the leader's reply, as ClusterClient.produce does.
+
+        Every attempt for one record carries the same producer id and sequence. If it
+        raises, the record may or may not be stored, and an attempt may still be queued
+        at the leader and stored later. Neither that id and sequence nor the next
+        sequence can then be given to another record, so the next record on this
+        partition goes out under a new producer id at sequence 0, which the leader
+        accepts as a producer it has not seen.
+        Kafka reference: TransactionManager (bumps the producer epoch in this case).
+        """
+        if partition is None:
+            partition = partition_for_key(key, self._partition_count(topic), value)
+        state = self._partition_state(topic, partition)
+        with state["lock"]:
+            try:
+                reply = self.client.produce(topic, value, key, partition, acks, retries,
+                                            state["producer_id"], state["next"])
+            except BaseException:
+                state.update(producer_id=uuid.uuid4().hex, next=0)
+                raise
+            state["next"] += 1
+            return reply
+
+    def _partition_state(self, topic: str, partition: int) -> dict:
+        with self._lock:
+            return self._partitions.setdefault(
+                (topic, partition),
+                {"lock": threading.Lock(), "producer_id": self.producer_id,
+                 "next": self.first_sequence})
+
+    def _partition_count(self, topic: str) -> int:
+        # Topics are fixed in the config, so one metadata request per topic is enough.
+        with self._lock:
+            count = self._partition_counts.get(topic)
+        if count is None:
+            count = self.client._partition_count(topic)
+            with self._lock:
+                self._partition_counts[topic] = count
+        return count
 
 
 class Consumer:

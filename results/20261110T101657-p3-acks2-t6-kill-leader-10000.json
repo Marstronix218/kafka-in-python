@@ -1,0 +1,80 @@
+{
+  "config": {
+    "events": 10000,
+    "partitions": 3,
+    "acks": 2,
+    "threads": 6,
+    "value_size": 100,
+    "fault": "kill-leader",
+    "brokers": 3,
+    "replication_factor": 3,
+    "retries": 10,
+    "heartbeat_timeout": 2.0,
+    "seed": 1
+  },
+  "metrics": {
+    "acknowledged": 10000,
+    "failed": 0,
+    "stored": 10000,
+    "duplicates": 0,
+    "lost": 0,
+    "failed_but_stored": 0,
+    "unexpected": 0,
+    "replica_mismatches": 0,
+    "duplicate_replies": 0,
+    "produce_seconds": 28.105,
+    "throughput_per_second": 355.8,
+    "latency_ms": {
+      "p50": 13.51,
+      "p95": 29.06,
+      "p99": 58.53,
+      "max": 2033.82
+    },
+    "latency_ms_mean": 15.87,
+    "isr_lag_max": 1,
+    "isr_lag_mean": 0.204,
+    "replica_lag_max": 1381,
+    "lag_samples": 314,
+    "min_isr_size": 2,
+    "short_isr_samples": 93,
+    "leader_changes": 1,
+    "errors": {}
+  },
+  "timeline": [
+    {
+      "t": 8.484,
+      "event": "killed",
+      "broker": "b1",
+      "leader_of": "events:0"
+    },
+    {
+      "t": 10.061,
+      "event": "new_leader",
+      "broker": "b2",
+      "leader_epoch": 1,
+      "seconds_after_kill": 1.576
+    },
+    {
+      "t": 16.397,
+      "event": "restarted",
+      "broker": "b1"
+    },
+    {
+      "t": 17.783,
+      "event": "full_isr_again",
+      "broker": "b1",
+      "seconds_after_restart": 1.385
+    }
+  ],
+  "started_at": "2026-11-10T10:16:57+00:00",
+  "wall_seconds": 28.8,
+  "environment": {
+    "git_commit": "e03e614",
+    "git_dirty": true,
+    "os": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu": "Apple M2",
+    "cpu_count": 8,
+    "python": "3.11.3"
+  }
+}

@@ -5,7 +5,7 @@ import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 
-from eventlog.controller import ControllerState, _handler_for
+from eventlog.controller import ControllerState, ISRUpdateRejected, _handler_for
 
 
 CONFIG = {
@@ -32,7 +32,8 @@ class ControllerStateTests(unittest.TestCase):
         self.assertEqual(["b2", "b3", "b1"], route["replicas"])
         self.assertEqual("b2", route["leader"])
         self.assertEqual(CONFIG["brokers"], route["brokers"])
-        self.assertNotIn("epoch", route)
+        self.assertEqual(0, route["leader_epoch"])
+        self.assertEqual(["b2", "b3", "b1"], route["isr"])
 
     def test_failover_moves_to_next_alive_replica_in_assignment_order(self) -> None:
         state = ControllerState(CONFIG, heartbeat_timeout=0.05)
@@ -69,10 +70,87 @@ class ControllerStateTests(unittest.TestCase):
         time.sleep(0.04)
         self.assertIsNone(state.route("orders", 0))
 
+    def test_leader_epoch_increments_on_each_failover(self) -> None:
+        state = ControllerState(CONFIG, heartbeat_timeout=0.05)
+        for broker_id in CONFIG["brokers"]:
+            state.heartbeat(broker_id)
+        self.assertEqual(("b1", 0), _leader_and_epoch(state))
+        self.assertEqual(("b1", 0), _leader_and_epoch(state))
+
+        time.sleep(0.06)
+        state.heartbeat("b2")
+        state.heartbeat("b3")
+        self.assertEqual(("b2", 1), _leader_and_epoch(state))
+
+        time.sleep(0.06)
+        state.heartbeat("b3")
+        self.assertEqual(("b3", 2), _leader_and_epoch(state))
+
+    def test_election_skips_alive_replicas_outside_the_isr(self) -> None:
+        state = ControllerState(CONFIG, heartbeat_timeout=0.05)
+        for broker_id in CONFIG["brokers"]:
+            state.heartbeat(broker_id)
+        state.route("orders", 0)
+        state.alter_isr("orders", 0, "b1", 0, ["b1", "b3"])
+
+        time.sleep(0.06)
+        state.heartbeat("b2")
+        self.assertIsNone(state.route("orders", 0))
+        self.assertEqual("no in-sync replica is alive", state.unavailable_reason("orders", 0))
+
+        state.heartbeat("b3")
+        route = state.route("orders", 0)
+        self.assertEqual(("b3", 1), (route["leader"], route["leader_epoch"]))
+        self.assertEqual(["b1", "b3"], route["isr"])
+
+    def test_alter_isr_accepts_only_the_current_leader_and_epoch(self) -> None:
+        state = ControllerState(CONFIG, heartbeat_timeout=0.05)
+        for broker_id in CONFIG["brokers"]:
+            state.heartbeat(broker_id)
+        state.route("orders", 0)
+
+        rejected = [("b2", 0, ["b2", "b3"]),           # not the leader
+                    ("b1", 1, ["b1"]),                 # wrong epoch
+                    ("b1", 0, ["b2", "b3"]),           # leaves out the leader
+                    ("b1", 0, ["b1", "b9"]),           # not a replica
+                    ("b1", 0, ["b1", "b1"])]           # duplicate
+        for leader, epoch, isr in rejected:
+            with self.subTest(leader=leader, epoch=epoch, isr=isr):
+                with self.assertRaises(ISRUpdateRejected):
+                    state.alter_isr("orders", 0, leader, epoch, isr)
+
+        result = state.alter_isr("orders", 0, "b1", 0, ["b3", "b1"])
+        self.assertEqual({"leader": "b1", "leader_epoch": 0, "isr": ["b1", "b3"]}, result)
+        self.assertEqual(["b1", "b3"], state.route("orders", 0)["isr"])
+
+    def test_unclean_election_elects_any_alive_replica_and_resets_isr(self) -> None:
+        for unclean in (False, True):
+            with self.subTest(unclean=unclean):
+                state = ControllerState(CONFIG, heartbeat_timeout=0.05,
+                                        unclean_leader_election=unclean)
+                for broker_id in CONFIG["brokers"]:
+                    state.heartbeat(broker_id)
+                state.route("orders", 0)
+                state.alter_isr("orders", 0, "b1", 0, ["b1"])
+
+                time.sleep(0.06)
+                state.heartbeat("b3")
+                route = state.route("orders", 0)
+                if unclean:
+                    self.assertEqual(("b3", 1, ["b3"]),
+                                     (route["leader"], route["leader_epoch"], route["isr"]))
+                else:
+                    self.assertIsNone(route)
+
     def test_unknown_broker_heartbeat_raises(self) -> None:
         state = ControllerState(CONFIG)
         with self.assertRaises(KeyError):
             state.heartbeat("b9")
+
+
+def _leader_and_epoch(state: ControllerState) -> tuple[str, int]:
+    route = state.route("orders", 0)
+    return route["leader"], route["leader_epoch"]
 
 
 class ControllerHTTPTests(unittest.TestCase):
@@ -136,6 +214,27 @@ class ControllerHTTPTests(unittest.TestCase):
 
         self.assertEqual(400, status)
         self.assertIn("b9", body["error"])
+
+    def test_isr_endpoint_rejects_stale_leader_with_409_and_bad_body_with_400(self) -> None:
+        # Long enough that b1 can't time out and lose leadership partway through.
+        self.state.heartbeat_timeout = 60
+        self.request("POST", "/heartbeat", {"broker_id": "b1"})
+        self.request("POST", "/heartbeat", {"broker_id": "b2"})
+        _, route = self.request("GET", "/route?topic=orders&partition=0")
+        update = {"topic": "orders", "partition": 0, "leader": "b1",
+                  "leader_epoch": route["leader_epoch"], "isr": ["b1", "b2"]}
+
+        stale_status, stale = self.request("POST", "/isr", {**update, "leader_epoch": 7})
+        other_status, other = self.request("POST", "/isr", {**update, "leader": "b2"})
+        bad_status, _ = self.request("POST", "/isr", {**update, "isr": "b1"})
+        status, result = self.request("POST", "/isr", update)
+
+        self.assertEqual((409, 409, 400, 200), (stale_status, other_status, bad_status, status))
+        self.assertIn("not the current leader", stale["error"])
+        self.assertIn("not the current leader", other["error"])
+        self.assertEqual(["b1", "b2"], result["isr"])
+        _, route = self.request("GET", "/route?topic=orders&partition=0")
+        self.assertEqual(["b1", "b2"], route["isr"])
 
 
 if __name__ == "__main__":
